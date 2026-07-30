@@ -1781,9 +1781,15 @@ pub(crate) fn execute_mem_op(cpu: &mut CpuCore, op: DecodedMemOp) -> bool {
 /// itself still has the existing all-or-nothing fallback contract.
 #[inline]
 pub(crate) fn execute_mem_op_with_cycles(cpu: &mut CpuCore, op: DecodedMemOp) -> FastMemExecution {
-    let cycles = op.cycle_cost(cpu);
+    // cycle を集計する経路では、命令 timing 全体が既知の場合だけ
+    // fastmem を使う。未対応命令は full dispatch で状態と cycle を揃える。
+    let Some(cycles) = op.cycle_cost(cpu) else {
+        return FastMemExecution::Fallback;
+    };
     if execute_mem_op(cpu, op) {
-        FastMemExecution::Executed { cycles }
+        FastMemExecution::Executed {
+            cycles: Some(cycles),
+        }
     } else {
         FastMemExecution::Fallback
     }
@@ -1898,6 +1904,29 @@ mod tests {
             FastMemExecution::Executed { cycles: Some(12) }
         );
         assert_eq!(cpu.d(0), 0x1234_5678);
+    }
+
+    #[test]
+    fn cycle_aware_fastmem_falls_back_before_unmodeled_op_changes_state() {
+        let mut mem = vec![0x5Au8; 0x1000];
+        let mut cpu = cpu_with_window(&mut mem);
+        let pc_before = cpu.pc;
+        let a5_before = cpu.a(5);
+        let mem_before = mem.clone();
+
+        assert_eq!(
+            execute_mem_op_with_cycles(
+                &mut cpu,
+                DecodedMemOp::Clr {
+                    size: Size::Byte,
+                    ea: FastEa::AnDisp(5),
+                },
+            ),
+            FastMemExecution::Fallback
+        );
+        assert_eq!(cpu.pc, pc_before);
+        assert_eq!(cpu.a(5), a5_before);
+        assert_eq!(mem, mem_before);
     }
 
     fn cpu_with_window(mem: &mut [u8]) -> CpuCore {
