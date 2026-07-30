@@ -194,6 +194,41 @@ fn measure_batch_loop_at(words: &[u16], instrs: u32, code_base: usize) -> f64 {
     elapsed
 }
 
+fn bench_cycle_batch_loop(max_cycles: u64) {
+    let words = [0x5280, 0x60FC]; // ADDQ.L #1,D0; BRA.S で loop
+    let code_base = 0x100;
+    let mut bus = LinearMemoryBus::new(0x10000);
+    for (i, word) in words.iter().enumerate() {
+        bus.write_word_at((code_base + i * 2) as u32, *word);
+    }
+
+    let prepare_cpu = || {
+        let mut cpu = CpuCore::new();
+        cpu.set_cpu_type(CpuType::M68040);
+        cpu.set_sr(0x2700);
+        cpu.pc = code_base as u32;
+        cpu.set_a(7, 0x8000);
+        cpu
+    };
+
+    let mut warm_cpu = prepare_cpu();
+    assert_eq!(
+        warm_cpu.run_batch(&mut bus, 1_000_000, &[0]).instructions,
+        1_000_000
+    );
+
+    let mut cpu = prepare_cpu();
+    let start = Instant::now();
+    let result = cpu.run_until_cycles(&mut bus, max_cycles, &[0]);
+    let elapsed = start.elapsed().as_secs_f64();
+    assert!(result.cycles >= max_cycles);
+    println!(
+        "cyclebatch trace loop        {:8.1} M instr/s  cycles={}",
+        result.instructions as f64 / elapsed / 1_000_000.0,
+        result.cycles
+    );
+}
+
 fn bench_one_shot_trace(head_ops: usize, instrs: u32) {
     assert!((2..=16).contains(&head_ops));
     let mut words = vec![0x5280; head_ops - 1]; // ADDQ.L #1,D0
@@ -816,6 +851,14 @@ fn bench_set<B: BenchBus>(label: &str) {
 fn main() {
     println!("m68k microbench");
     let only = std::env::args().nth(1);
+    if only.as_deref() == Some("cycle-batch") {
+        let max_cycles = std::env::args()
+            .nth(2)
+            .map(|value| value.parse().expect("cycle count must be an integer"))
+            .unwrap_or(100_000_000);
+        bench_cycle_batch_loop(max_cycles);
+        return;
+    }
     if only.as_deref() == Some("trace-calls") {
         // The trace function returns to the Rust self-loop driver after each
         // iteration, isolating the native call-boundary break-even point.
