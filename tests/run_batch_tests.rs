@@ -739,13 +739,15 @@ fn assemble(words: &[u16]) -> Vec<u8> {
 
 /// Run `words` at 0x1000 to the A-line sentinel with step() (bus without
 /// fastmem) and with run_batch() (bus with fastmem); assert identical
-/// counts, registers, SR, PC, and memory.
+/// counts, registers, SR, PC, and memory. Returns the reference cycle total
+/// reported by `step()` so cycle-accounted fastmem paths can be compared
+/// without changing the existing state-equivalence coverage.
 fn assert_fastmem_matches_step(
     label: &str,
     words: &[u16],
     cpu_type: CpuType,
     setup: impl Fn(&mut CpuCore),
-) {
+) -> u64 {
     let bytes = assemble(words);
 
     let mk_cpu = |pc: u32| {
@@ -763,9 +765,13 @@ fn assert_fastmem_matches_step(
     bus_a.load(0x1000, &bytes);
     let mut cpu_a = mk_cpu(0x1000);
     let mut steps: u64 = 0;
+    let mut reference_cycles: u64 = 0;
     loop {
         match cpu_a.step(&mut bus_a) {
-            m68k::StepResult::Ok { .. } => steps += 1,
+            m68k::StepResult::Ok { cycles } => {
+                steps += 1;
+                reference_cycles += cycles as u64;
+            }
             m68k::StepResult::AlineTrap { .. } => break,
             other => panic!("{label}: unexpected step result {other:?}"),
         }
@@ -794,6 +800,19 @@ fn assert_fastmem_matches_step(
         assert_eq!(cpu_a.a(i), cpu_b.a(i), "{label}: A{i}");
     }
     assert_eq!(bus_a.mem, bus_b.mem, "{label}: memory contents");
+    reference_cycles
+}
+
+#[test]
+fn fastmem_reference_cycle_total_uses_step_accounting() {
+    let reference_cycles = assert_fastmem_matches_step(
+        "cycle-reference",
+        &[0x4E71, 0xA000], // NOP; A-line sentinel
+        CpuType::M68000,
+        |_| {},
+    );
+
+    assert_eq!(reference_cycles, 4);
 }
 
 #[test]
