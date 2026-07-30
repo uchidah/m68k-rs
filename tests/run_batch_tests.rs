@@ -860,6 +860,58 @@ fn assert_fastmem_matches_step(
     reference_cycles
 }
 
+fn assert_cycle_batch_matches_hook(
+    label: &str,
+    words: &[u16],
+    cpu_type: CpuType,
+    setup: impl Fn(&mut CpuCore),
+) {
+    let bytes = assemble(words);
+    let mk_cpu = |pc: u32| {
+        let mut cpu = CpuCore::new();
+        cpu.set_cpu_type(cpu_type);
+        cpu.pc = pc;
+        cpu.set_sr(0x2700);
+        cpu.set_a(7, 0x9000);
+        setup(&mut cpu);
+        cpu
+    };
+
+    let mut hook_bus = FastRamBus::new(0x20000);
+    hook_bus.load(0x1000, &bytes);
+    let mut hook_cpu = mk_cpu(0x1000);
+    let hook = hook_cpu.run_until_cycles_with_hook(&mut hook_bus, u64::MAX, &[], |_, _, _| {
+        CycleBatchControl::Continue
+    });
+
+    let mut fast_bus = FastRamBus::new(0x20000);
+    fast_bus.load(0x1000, &bytes);
+    let mut fast_cpu = mk_cpu(0x1000);
+    let fast = fast_cpu.run_until_cycles(&mut fast_bus, u64::MAX, &[]);
+
+    assert_eq!(fast, hook, "{label}: cycle result");
+    assert_eq!(fast_cpu.pc, hook_cpu.pc, "{label}: pc");
+    assert_eq!(fast_cpu.get_sr(), hook_cpu.get_sr(), "{label}: sr");
+    for i in 0..8 {
+        assert_eq!(fast_cpu.d(i), hook_cpu.d(i), "{label}: D{i}");
+        assert_eq!(fast_cpu.a(i), hook_cpu.a(i), "{label}: A{i}");
+    }
+    assert_eq!(fast_bus.mem, hook_bus.mem, "{label}: memory contents");
+}
+
+#[test]
+fn cycle_batch_fastmem_and_dispatch_match_hook() {
+    assert_cycle_batch_matches_hook(
+        "cycle-fastmem-dispatch",
+        &[0x3018, 0x0640, 0x0001, 0x3280, 0xA000],
+        CpuType::M68000,
+        |cpu| {
+            cpu.set_a(0, 0x12000);
+            cpu.set_a(1, 0x13000);
+        },
+    );
+}
+
 #[test]
 fn fastmem_reference_cycle_total_uses_step_accounting() {
     let reference_cycles = assert_fastmem_matches_step(
