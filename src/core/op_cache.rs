@@ -192,6 +192,8 @@ pub(crate) enum BatchInnerExitReason {
     Miss(u16),
     /// retire 済み命令の後で cycle deadline に到達または超過した。
     CycleLimit,
+    /// The address bus requires the embedder to observe the retired instruction.
+    BusRequestedBoundary,
     /// retire 済み fast path が検証済みの cycle 合計を返さなかった。
     CycleAccountingUnknown,
 }
@@ -1225,6 +1227,12 @@ impl CpuCore {
                         CachedRunResult::Ran => {
                             remaining -= trace.instructions;
                             *retired += trace.instructions;
+                            if cycle_limit.is_some() && bus.instruction_boundary_requested() {
+                                return BatchInnerExit {
+                                    reason: BatchInnerExitReason::BusRequestedBoundary,
+                                    cycles,
+                                };
+                            }
                             if watch && watch_pcs.contains(&self.pc) {
                                 return BatchInnerExit {
                                     reason: BatchInnerExitReason::Watched(self.pc),
@@ -1338,6 +1346,13 @@ impl CpuCore {
             }
             remaining -= 1;
             *retired += 1;
+            if cycle_limit.is_some() && bus.instruction_boundary_requested() {
+                trace_jit::stop_recording(self);
+                return BatchInnerExit {
+                    reason: BatchInnerExitReason::BusRequestedBoundary,
+                    cycles,
+                };
+            }
             if watch && watch_pcs.contains(&self.pc) {
                 trace_jit::stop_recording(self);
                 return BatchInnerExit {

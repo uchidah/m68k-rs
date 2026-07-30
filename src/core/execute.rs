@@ -333,6 +333,13 @@ impl CpuCore {
                             exit: CycleBatchExit::WatchedPc { pc },
                         };
                     }
+                    BatchInnerExitReason::BusRequestedBoundary => {
+                        return CycleBatchResult {
+                            instructions,
+                            cycles,
+                            exit: CycleBatchExit::BusRequestedBoundary,
+                        };
+                    }
                     BatchInnerExitReason::Fault => {
                         self.run_mode = RUN_MODE_NORMAL;
                         probe_on_entry = true;
@@ -444,6 +451,14 @@ impl CpuCore {
                     instructions,
                     cycles,
                     exit: CycleBatchExit::Stopped,
+                };
+            }
+
+            if bus.instruction_boundary_requested() {
+                return CycleBatchResult {
+                    instructions,
+                    cycles,
+                    exit: CycleBatchExit::BusRequestedBoundary,
                 };
             }
 
@@ -646,6 +661,7 @@ impl CpuCore {
                         opcode
                     }
                     BatchInnerExitReason::CycleLimit
+                    | BatchInnerExitReason::BusRequestedBoundary
                     | BatchInnerExitReason::CycleAccountingUnknown => {
                         unreachable!("instruction-budgeted batch cannot return a cycle exit")
                     }

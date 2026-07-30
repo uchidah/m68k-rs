@@ -282,6 +282,8 @@ pub enum CycleBatchExit {
     IllegalInstruction { opcode: u16 },
     /// The caller's instruction-boundary hook requested a stop.
     CallbackRequestedStop,
+    /// The address bus requested a return after the just-completed instruction.
+    BusRequestedBoundary,
 }
 
 /// Control flow returned by an instruction-boundary hook supplied to

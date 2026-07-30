@@ -99,6 +99,16 @@ pub trait AddressBus {
     }
     fn reset_devices(&mut self) {}
 
+    /// Return `true` once when a completed instruction must become visible to
+    /// the embedder before the CPU fetches another instruction.
+    ///
+    /// Cycle-aware batch execution checks this only at instruction boundaries.
+    /// The default keeps existing buses batchable without an extra callback.
+    #[inline]
+    fn instruction_boundary_requested(&mut self) -> bool {
+        false
+    }
+
     /// Expose a direct window into contiguous, side-effect-free guest RAM.
     ///
     /// See [`FastMem`] for the exact contract. Returning `Some` lets
