@@ -204,6 +204,7 @@ fn add_batch_cycles(total: &mut Option<u64>, cycles: Option<i32>) {
 #[cfg(test)]
 mod batch_cycle_tests {
     use super::add_batch_cycles;
+    use crate::{CpuCore, CpuType, LinearMemoryBus};
 
     #[test]
     fn unknown_batch_cycles_are_not_reintroduced_as_zero() {
@@ -216,6 +217,23 @@ mod batch_cycle_tests {
 
         add_batch_cycles(&mut total, Some(4));
         assert_eq!(total, None);
+    }
+
+    #[test]
+    fn decoded_batch_reports_exact_nop_cycle_total() {
+        let mut cpu = CpuCore::new();
+        cpu.set_cpu_type(CpuType::M68000);
+        cpu.pc = 0x100;
+        let mut bus = LinearMemoryBus::new(0x1000);
+        bus.load(0x100, &[0x4E, 0x71, 0x4E, 0x71]);
+        let mut retired = 0;
+
+        let exit = cpu.run_decoded_simple_batch(&mut bus, 2, &[], &mut retired, true);
+
+        assert!(matches!(exit.reason, super::BatchInnerExitReason::Budget));
+        assert_eq!(exit.cycles, Some(8));
+        assert_eq!(retired, 2);
+        assert_eq!(cpu.pc, 0x104);
     }
 }
 
