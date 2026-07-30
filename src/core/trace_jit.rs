@@ -487,7 +487,7 @@ impl TraceJit {
         instr_budget: u32,
         single_iter: bool,
         watch_pcs: &[u32],
-    ) -> Option<(CachedRunResult, u32)> {
+    ) -> Option<(CachedRunResult, u32, Option<u64>)> {
         #[cfg(not(target_family = "wasm"))]
         self.module.as_ref()?;
 
@@ -610,7 +610,7 @@ impl TraceJit {
                 cpu.ppc = ppc;
                 cpu.ir = opcode as u32;
                 cpu.pc = cpu.ppc.wrapping_add(2);
-                return Some((CachedRunResult::Miss(opcode), 0));
+                return Some((CachedRunResult::Miss(opcode), 0, None));
             }
 
             let ops_len = trace.ops.len() as u32;
@@ -775,7 +775,11 @@ impl TraceJit {
                 #[cfg(feature = "trace-profile")]
                 super::trace_profile::note_adaptive_rerecord(pc, cpu_type);
             }
-            return Some((CachedRunResult::Ran, retired));
+            return Some((
+                CachedRunResult::Ran,
+                retired,
+                u64::try_from(cycles_total).ok(),
+            ));
         }
 
         match &mut self.slots[idx] {
@@ -1453,7 +1457,7 @@ struct CompileParams<'a> {
 pub(crate) struct TraceExecution {
     pub(crate) result: CachedRunResult,
     pub(crate) instructions: u32,
-    /// Trace 内の合計 cycle はまだ公開されていない。
+    /// Trace 内で retire 済みの cycle 合計。表現不能な値は `None`。
     pub(crate) cycles: Option<u64>,
 }
 
@@ -1476,10 +1480,10 @@ pub(crate) fn try_execute_trace<B: AddressBus>(
         .with_borrow_mut(|jit| {
             jit.try_execute(cpu, bus, cpu_type, instr_budget, single_iter, watch_pcs)
         })
-        .map(|(result, instructions)| TraceExecution {
+        .map(|(result, instructions, cycles)| TraceExecution {
             result,
             instructions,
-            cycles: None,
+            cycles,
         })
 }
 
