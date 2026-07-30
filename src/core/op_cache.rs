@@ -1225,14 +1225,14 @@ impl CpuCore {
                         CachedRunResult::Ran => {
                             remaining -= trace.instructions;
                             *retired += trace.instructions;
-                            if let Some(reason) = cycle_batch_exit(cycles, cycle_limit) {
-                                return BatchInnerExit { reason, cycles };
-                            }
                             if watch && watch_pcs.contains(&self.pc) {
                                 return BatchInnerExit {
                                     reason: BatchInnerExitReason::Watched(self.pc),
                                     cycles,
                                 };
+                            }
+                            if let Some(reason) = cycle_batch_exit(cycles, cycle_limit) {
+                                return BatchInnerExit { reason, cycles };
                             }
                             probe = true;
                             continue;
@@ -1338,16 +1338,16 @@ impl CpuCore {
             }
             remaining -= 1;
             *retired += 1;
-            if let Some(reason) = cycle_batch_exit(cycles, cycle_limit) {
-                trace_jit::stop_recording(self);
-                return BatchInnerExit { reason, cycles };
-            }
             if watch && watch_pcs.contains(&self.pc) {
                 trace_jit::stop_recording(self);
                 return BatchInnerExit {
                     reason: BatchInnerExitReason::Watched(self.pc),
                     cycles,
                 };
+            }
+            if let Some(reason) = cycle_batch_exit(cycles, cycle_limit) {
+                trace_jit::stop_recording(self);
+                return BatchInnerExit { reason, cycles };
             }
         }
 

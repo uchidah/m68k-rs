@@ -46,6 +46,27 @@ impl CpuCore {
         self.sr_save = self.get_sr();
     }
 
+    fn capture_fastmem_window<B: AddressBus>(&mut self, bus: &mut B) {
+        if !(self.has_pmmu && self.pmmu_enabled)
+            && let Some(fm) = bus.fast_mem()
+            && fm.len >= 4
+            && !fm.ptr.is_null()
+        {
+            self.fm_ptr = fm.ptr as usize;
+            self.fm_base = fm.base;
+            self.fm_len = fm.len;
+            self.trace_record_skip = [super::trace_jit::TRACE_PC_NONE; 4];
+            self.trace_probe_skip = [super::trace_jit::TRACE_PC_NONE; 4];
+        }
+    }
+
+    #[inline]
+    fn clear_fastmem_window(&mut self) {
+        self.fm_ptr = 0;
+        self.fm_base = 0;
+        self.fm_len = 0;
+    }
+
     /// Caller must have checked [`CpuCore::can_run_decoded_simple_ops`].
     #[inline]
     fn try_execute_decoded_simple_step(&mut self, opcode: u16) -> Option<StepResult> {
@@ -226,26 +247,9 @@ impl CpuCore {
         max_instructions: u32,
         watch_pcs: &[u32],
     ) -> BatchResult {
-        // Capture the bus's fastmem window for the duration of this batch.
-        // Never with an active MMU: fastmem addresses are physical.
-        if !(self.has_pmmu && self.pmmu_enabled)
-            && let Some(fm) = bus.fast_mem()
-            && fm.len >= 4
-            && !fm.ptr.is_null()
-        {
-            self.fm_ptr = fm.ptr as usize;
-            self.fm_base = fm.base;
-            self.fm_len = fm.len;
-            // Memory traces are skipped (and probe-filtered) while no
-            // window is active; with the window up they can run, so
-            // re-arm the trace filters.
-            self.trace_record_skip = [super::trace_jit::TRACE_PC_NONE; 4];
-            self.trace_probe_skip = [super::trace_jit::TRACE_PC_NONE; 4];
-        }
+        self.capture_fastmem_window(bus);
         let result = self.run_batch_inner(bus, max_instructions, watch_pcs);
-        self.fm_ptr = 0;
-        self.fm_base = 0;
-        self.fm_len = 0;
+        self.clear_fastmem_window();
         result
     }
 
@@ -258,19 +262,207 @@ impl CpuCore {
     /// returned cycle count. A-line/F-line and other traps are surfaced with
     /// the same state and accounting rules as [`step`](Self::step).
     ///
-    /// This initial cycle-accounted path deliberately uses `step()` rather
-    /// than the decoded/trace batch fast paths: those paths currently discard
-    /// per-instruction cycle data. Keeping this API cycle-correct gives the
-    /// optimized paths a stable differential-test target.
     pub fn run_until_cycles<B: AddressBus>(
         &mut self,
         bus: &mut B,
         max_cycles: u64,
         watch_pcs: &[u32],
     ) -> CycleBatchResult {
-        self.run_until_cycles_with_hook(bus, max_cycles, watch_pcs, |_, _, _| {
-            CycleBatchControl::Continue
-        })
+        if max_cycles == 0 {
+            return CycleBatchResult {
+                instructions: 0,
+                cycles: 0,
+                exit: CycleBatchExit::CycleLimitReached,
+            };
+        }
+
+        self.capture_fastmem_window(bus);
+        let result = self.run_until_cycles_inner(bus, max_cycles, watch_pcs);
+        self.clear_fastmem_window();
+        result
+    }
+
+    fn run_until_cycles_inner<B: AddressBus>(
+        &mut self,
+        bus: &mut B,
+        max_cycles: u64,
+        watch_pcs: &[u32],
+    ) -> CycleBatchResult {
+        use crate::core::types::InternalStepResult;
+
+        if self.stopped != 0 {
+            return CycleBatchResult {
+                instructions: 0,
+                cycles: 0,
+                exit: CycleBatchExit::Stopped,
+            };
+        }
+
+        let mut instructions = 0;
+        let mut cycles = 0;
+        let mut probe_on_entry = true;
+
+        loop {
+            let mut known_complex = false;
+            let opcode = if self.can_run_decoded_simple_ops() {
+                let batch_exit = self.run_decoded_simple_cycle_batch(
+                    bus,
+                    max_cycles - cycles,
+                    watch_pcs,
+                    &mut instructions,
+                    probe_on_entry,
+                );
+                let batch_cycles = batch_exit
+                    .cycles
+                    .expect("cycle-aware decoded batch returned unknown cycles");
+                cycles = cycles
+                    .checked_add(batch_cycles)
+                    .expect("cycle-aware decoded batch cycle total overflowed");
+                match batch_exit.reason {
+                    BatchInnerExitReason::CycleLimit => {
+                        return CycleBatchResult {
+                            instructions,
+                            cycles,
+                            exit: CycleBatchExit::CycleLimitReached,
+                        };
+                    }
+                    BatchInnerExitReason::Watched(pc) => {
+                        return CycleBatchResult {
+                            instructions,
+                            cycles,
+                            exit: CycleBatchExit::WatchedPc { pc },
+                        };
+                    }
+                    BatchInnerExitReason::Fault => {
+                        self.run_mode = RUN_MODE_NORMAL;
+                        probe_on_entry = true;
+                        continue;
+                    }
+                    BatchInnerExitReason::Miss(opcode) => {
+                        known_complex = true;
+                        opcode
+                    }
+                    BatchInnerExitReason::CycleAccountingUnknown => {
+                        unreachable!("cycle-aware decoded batch must not retire unknown cycles")
+                    }
+                    BatchInnerExitReason::Budget => {
+                        unreachable!(
+                            "cycle-aware decoded batch cannot exhaust its instruction budget"
+                        )
+                    }
+                }
+            } else {
+                self.ppc = self.pc;
+                let opcode = self.read_opcode_16(bus);
+                if self.run_mode == RUN_MODE_BERR_AERR_RESET {
+                    self.run_mode = RUN_MODE_NORMAL;
+                    probe_on_entry = true;
+                    continue;
+                }
+                self.ir = opcode as u32;
+                opcode
+            };
+
+            if self.ir != opcode as u32 {
+                self.ir = opcode as u32;
+            }
+
+            if known_complex {
+                self.prepare_rollback_snapshot_full();
+            } else {
+                self.prepare_rollback_snapshot(opcode);
+            }
+
+            let result = dispatch_instruction(self, bus, opcode);
+
+            if self.fm_len != 0 && self.has_pmmu && self.pmmu_enabled {
+                self.clear_fastmem_window();
+            }
+
+            let mut instruction_cycles = match result {
+                InternalStepResult::Ok { cycles } => cycles,
+                InternalStepResult::AlineTrap { opcode } => {
+                    return CycleBatchResult {
+                        instructions,
+                        cycles,
+                        exit: CycleBatchExit::AlineTrap { opcode },
+                    };
+                }
+                InternalStepResult::FlineTrap { opcode } => {
+                    return CycleBatchResult {
+                        instructions,
+                        cycles,
+                        exit: CycleBatchExit::FlineTrap { opcode },
+                    };
+                }
+                InternalStepResult::TrapInstruction { trap_num } => {
+                    return CycleBatchResult {
+                        instructions,
+                        cycles,
+                        exit: CycleBatchExit::TrapInstruction { trap_num },
+                    };
+                }
+                InternalStepResult::Breakpoint { bp_num } => {
+                    return CycleBatchResult {
+                        instructions,
+                        cycles,
+                        exit: CycleBatchExit::Breakpoint { bp_num },
+                    };
+                }
+                InternalStepResult::IllegalInstruction { opcode } => {
+                    return CycleBatchResult {
+                        instructions,
+                        cycles,
+                        exit: CycleBatchExit::IllegalInstruction { opcode },
+                    };
+                }
+            };
+            instructions += 1;
+
+            if self.run_mode == RUN_MODE_BERR_AERR_RESET {
+                self.run_mode = RUN_MODE_NORMAL;
+                probe_on_entry = true;
+            } else {
+                probe_on_entry =
+                    self.pc <= self.ppc && trace_jit::note_backward_branch(self, self.cpu_type);
+
+                if !self.sst_m68000_compat && self.check_trace() {
+                    instruction_cycles += self.exception_trace(bus);
+                }
+
+                if self.int_level > 0 {
+                    self.check_and_service_interrupts(bus);
+                }
+            }
+
+            cycles = cycles
+                .checked_add(instruction_cycles as u64)
+                .expect("cycle-aware dispatch cycle total overflowed");
+
+            if self.stopped != 0 {
+                return CycleBatchResult {
+                    instructions,
+                    cycles,
+                    exit: CycleBatchExit::Stopped,
+                };
+            }
+
+            if !watch_pcs.is_empty() && watch_pcs.contains(&self.pc) {
+                return CycleBatchResult {
+                    instructions,
+                    cycles,
+                    exit: CycleBatchExit::WatchedPc { pc: self.pc },
+                };
+            }
+
+            if cycles >= max_cycles {
+                return CycleBatchResult {
+                    instructions,
+                    cycles,
+                    exit: CycleBatchExit::CycleLimitReached,
+                };
+            }
+        }
     }
 
     /// Execute instructions until their reported cycles reach or cross a

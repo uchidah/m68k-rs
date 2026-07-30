@@ -52,6 +52,21 @@ fn cycle_batch_stops_after_crossing_limit() {
 }
 
 #[test]
+fn cycle_batch_accounts_for_fastmem_move_before_stopping() {
+    let mut bus = bus_with(&[(0x1000, 0x3010)]); // MOVE.W (A0) から D0
+    bus.load(0x2000, &[0x12, 0x34]);
+    let mut cpu = cpu_at(0x1000);
+    cpu.set_a(0, 0x2000);
+
+    let result = cpu.run_until_cycles(&mut bus, 7, &[]);
+
+    assert_eq!(result.exit, CycleBatchExit::CycleLimitReached);
+    assert_eq!(result.instructions, 1);
+    assert_eq!(result.cycles, 8);
+    assert_eq!(cpu.d(0), 0x1234);
+}
+
+#[test]
 fn cycle_batch_surfaces_traps_without_counting_them() {
     let mut bus = bus_with(&[(0x1000, 0x7001), (0x1002, 0xA123)]);
     let mut cpu = cpu_at(0x1000);
@@ -93,6 +108,48 @@ fn cycle_batch_hook_stops_after_the_completed_instruction() {
     assert_eq!(result.cycles, 4);
     assert_eq!(calls, 1);
     assert_eq!(cpu.pc, 0x1002);
+}
+
+#[test]
+fn cycle_batch_matches_hook_for_mixed_dispatch() {
+    let words = [(0x1000, 0x7001), (0x1002, 0x0640), (0x1004, 0x0001)];
+    let mut fast_bus = bus_with(&words);
+    let mut step_bus = bus_with(&words);
+    let mut fast_cpu = cpu_at(0x1000);
+    let mut step_cpu = cpu_at(0x1000);
+
+    let fast = fast_cpu.run_until_cycles(&mut fast_bus, 20, &[]);
+    let step = step_cpu.run_until_cycles_with_hook(&mut step_bus, 20, &[], |_, _, _| {
+        CycleBatchControl::Continue
+    });
+
+    assert_eq!(fast, step);
+    assert_eq!(fast_cpu.pc, step_cpu.pc);
+    assert_eq!(fast_cpu.d(0), step_cpu.d(0));
+    assert_eq!(fast_cpu.get_sr(), step_cpu.get_sr());
+}
+
+#[test]
+fn cycle_batch_matches_hook_after_trace_warmup() {
+    let words = [(0x1000, 0x5280), (0x1002, 0x60FC)];
+    let mut warm_bus = bus_with(&words);
+    let mut warm_cpu = cpu_at(0x1000);
+    let _ = warm_cpu.run_batch(&mut warm_bus, 20_000, &[]);
+
+    let mut fast_bus = bus_with(&words);
+    let mut step_bus = bus_with(&words);
+    let mut fast_cpu = cpu_at(0x1000);
+    let mut step_cpu = cpu_at(0x1000);
+
+    let fast = fast_cpu.run_until_cycles(&mut fast_bus, 1_000, &[]);
+    let step = step_cpu.run_until_cycles_with_hook(&mut step_bus, 1_000, &[], |_, _, _| {
+        CycleBatchControl::Continue
+    });
+
+    assert_eq!(fast, step);
+    assert_eq!(fast_cpu.pc, step_cpu.pc);
+    assert_eq!(fast_cpu.d(0), step_cpu.d(0));
+    assert_eq!(fast_cpu.get_sr(), step_cpu.get_sr());
 }
 
 #[test]
