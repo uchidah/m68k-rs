@@ -271,6 +271,16 @@ impl DecodedMemOp {
     }
 }
 
+/// Outcome of executing one decoded fastmem operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FastMemExecution {
+    /// The operation completed. `cycles` is present once that opcode family
+    /// has a verified cycle model.
+    Executed { cycles: Option<i32> },
+    /// The operation made no state changes and must use full dispatch.
+    Fallback,
+}
+
 #[inline]
 fn decode_size_00(bits: u16) -> Option<Size> {
     match bits {
@@ -1764,6 +1774,21 @@ pub(crate) fn execute_mem_op(cpu: &mut CpuCore, op: DecodedMemOp) -> bool {
     }
 }
 
+/// Cycle-aware wrapper for the batch loop.
+///
+/// `cycle_cost` is evaluated before execution so it observes the same address
+/// mode and CPU type as the interpreter's timing calculation. The operation
+/// itself still has the existing all-or-nothing fallback contract.
+#[inline]
+pub(crate) fn execute_mem_op_with_cycles(cpu: &mut CpuCore, op: DecodedMemOp) -> FastMemExecution {
+    let cycles = op.cycle_cost(cpu);
+    if execute_mem_op(cpu, op) {
+        FastMemExecution::Executed { cycles }
+    } else {
+        FastMemExecution::Fallback
+    }
+}
+
 #[inline(always)]
 fn apply_binary_to_reg(
     cpu: &mut CpuCore,
@@ -1851,6 +1876,28 @@ mod tests {
             .cycle_cost(&cpu),
             None
         );
+    }
+
+    #[test]
+    fn cycle_aware_fastmem_execution_reports_move_cycles() {
+        let mut mem = vec![0u8; 0x1000];
+        mem[0x200..0x204].copy_from_slice(&0x1234_5678u32.to_be_bytes());
+        let mut cpu = cpu_with_window(&mut mem);
+        cpu.set_cpu_type(CpuType::M68000);
+        cpu.set_a(0, 0x200);
+
+        assert_eq!(
+            execute_mem_op_with_cycles(
+                &mut cpu,
+                DecodedMemOp::Move {
+                    size: Size::Long,
+                    src: FastEa::AnInd(0),
+                    dst: FastEa::DataReg(0),
+                },
+            ),
+            FastMemExecution::Executed { cycles: Some(12) }
+        );
+        assert_eq!(cpu.d(0), 0x1234_5678);
     }
 
     fn cpu_with_window(mem: &mut [u8]) -> CpuCore {

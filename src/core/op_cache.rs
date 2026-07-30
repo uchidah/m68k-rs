@@ -1116,7 +1116,10 @@ impl CpuCore {
                     }
                 }
                 CachedOp::Mem(op) => {
-                    if !super::mem_ops::execute_mem_op(self, op) {
+                    if matches!(
+                        super::mem_ops::execute_mem_op_with_cycles(self, op),
+                        super::mem_ops::FastMemExecution::Fallback
+                    ) {
                         trace_jit::stop_recording(self);
                         return BatchInnerExit::Miss(opcode);
                     }
