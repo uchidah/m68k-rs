@@ -190,6 +190,10 @@ pub(crate) enum BatchInnerExitReason {
     /// the opcode has been fetched (`ppc`/`ir` are set) and full
     /// dispatch should handle it.
     Miss(u16),
+    /// retire 済み命令の後で cycle deadline に到達または超過した。
+    CycleLimit,
+    /// retire 済み fast path が検証済みの cycle 合計を返さなかった。
+    CycleAccountingUnknown,
 }
 
 #[inline]
@@ -201,9 +205,25 @@ fn add_batch_cycles(total: &mut Option<u64>, cycles: Option<i32>) {
     });
 }
 
+#[inline]
+fn add_trace_cycles(total: &mut Option<u64>, cycles: Option<u64>) {
+    *total = (*total).and_then(|total| cycles.and_then(|cycles| total.checked_add(cycles)));
+}
+
+#[inline]
+fn cycle_batch_exit(cycles: Option<u64>, limit: Option<u64>) -> Option<BatchInnerExitReason> {
+    let limit = limit?;
+    match cycles {
+        Some(cycles) if cycles >= limit => Some(BatchInnerExitReason::CycleLimit),
+        Some(_) => None,
+        None => Some(BatchInnerExitReason::CycleAccountingUnknown),
+    }
+}
+
 #[cfg(test)]
 mod batch_cycle_tests {
     use super::add_batch_cycles;
+    use crate::core::memory::AddressBus;
     use crate::{CpuCore, CpuType, LinearMemoryBus};
 
     #[test]
@@ -234,6 +254,52 @@ mod batch_cycle_tests {
         assert_eq!(exit.cycles, Some(8));
         assert_eq!(retired, 2);
         assert_eq!(cpu.pc, 0x104);
+    }
+
+    #[test]
+    fn cycle_batch_stops_after_decoded_instruction_crosses_deadline() {
+        let mut cpu = CpuCore::new();
+        cpu.set_cpu_type(CpuType::M68000);
+        cpu.pc = 0x100;
+        let mut bus = LinearMemoryBus::new(0x1000);
+        bus.load(0x100, &[0x4E, 0x71, 0x4E, 0x71]);
+        let mut retired = 0;
+
+        let exit = cpu.run_decoded_simple_cycle_batch(&mut bus, 6, &[], &mut retired, true);
+
+        assert!(matches!(
+            exit.reason,
+            super::BatchInnerExitReason::CycleLimit
+        ));
+        assert_eq!(exit.cycles, Some(8));
+        assert_eq!(retired, 2);
+        assert_eq!(cpu.pc, 0x104);
+    }
+
+    #[test]
+    fn cycle_batch_accounts_for_fastmem_move_before_stopping() {
+        let mut cpu = CpuCore::new();
+        cpu.set_cpu_type(CpuType::M68000);
+        cpu.pc = 0x100;
+        cpu.set_a(0, 0x200);
+        let mut bus = LinearMemoryBus::new(0x1000);
+        bus.load(0x100, &[0x30, 0x10]); // MOVE.W (A0) から D0
+        bus.load(0x200, &[0x12, 0x34]);
+        let fm = bus.fast_mem().expect("LinearMemoryBus exposes fastmem");
+        cpu.fm_ptr = fm.ptr as usize;
+        cpu.fm_base = fm.base;
+        cpu.fm_len = fm.len;
+        let mut retired = 0;
+
+        let exit = cpu.run_decoded_simple_cycle_batch(&mut bus, 7, &[], &mut retired, true);
+
+        assert!(matches!(
+            exit.reason,
+            super::BatchInnerExitReason::CycleLimit
+        ));
+        assert_eq!(exit.cycles, Some(8));
+        assert_eq!(retired, 1);
+        assert_eq!(cpu.d(0), 0x1234);
     }
 }
 
@@ -1075,6 +1141,44 @@ impl CpuCore {
         retired: &mut u32,
         probe_on_entry: bool,
     ) -> BatchInnerExit {
+        self.run_decoded_simple_batch_with_cycle_limit(
+            bus,
+            budget,
+            None,
+            watch_pcs,
+            retired,
+            probe_on_entry,
+        )
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn run_decoded_simple_cycle_batch<B: AddressBus>(
+        &mut self,
+        bus: &mut B,
+        max_cycles: u64,
+        watch_pcs: &[u32],
+        retired: &mut u32,
+        probe_on_entry: bool,
+    ) -> BatchInnerExit {
+        self.run_decoded_simple_batch_with_cycle_limit(
+            bus,
+            u32::MAX,
+            Some(max_cycles),
+            watch_pcs,
+            retired,
+            probe_on_entry,
+        )
+    }
+
+    fn run_decoded_simple_batch_with_cycle_limit<B: AddressBus>(
+        &mut self,
+        bus: &mut B,
+        budget: u32,
+        cycle_limit: Option<u64>,
+        watch_pcs: &[u32],
+        retired: &mut u32,
+        probe_on_entry: bool,
+    ) -> BatchInnerExit {
         let cpu_type = self.cpu_type;
         let watch = !watch_pcs.is_empty();
         let mut remaining = budget;
@@ -1085,13 +1189,18 @@ impl CpuCore {
 
         while remaining > 0 {
             if probe && remaining >= trace_jit::TRACE_MIN_OPS as u32 {
-                // run_batch is instruction-budgeted, not cycle-budgeted.
-                // A long-running self-loop can consume the synthetic cycle
-                // headroom in one trace call; replenish it before every
-                // probe so subsequent iterations do not silently fall back
-                // to the interpreter. Cycle-budgeted callers use the other
-                // decoded-op loop and retain their real remaining budget.
-                self.cycles_remaining = i32::MAX / 2;
+                self.cycles_remaining = match cycle_limit {
+                    Some(limit) => match cycles {
+                        Some(cycles) => limit.saturating_sub(cycles).min(i32::MAX as u64) as i32,
+                        None => {
+                            return BatchInnerExit {
+                                reason: BatchInnerExitReason::CycleAccountingUnknown,
+                                cycles,
+                            };
+                        }
+                    },
+                    None => i32::MAX / 2,
+                };
                 probe = false;
                 // A self-loop only needs to stop after one iteration when
                 // returning to its own head would hit a watched PC. Merely
@@ -1102,17 +1211,23 @@ impl CpuCore {
                     self,
                     bus,
                     cpu_type,
-                    remaining,
+                    if cycle_limit.is_some() {
+                        u32::MAX
+                    } else {
+                        remaining
+                    },
                     single_iter,
                     watch_pcs,
                 ) {
-                    // trace JIT は合計 cycle をまだ公開しないため、ここで
-                    // 不明扱いにする。既知 cycle を 0 としてはいけない。
-                    cycles = trace.cycles;
+                    // trace JIT の合計 cycle は累積する。未知値は `None` のまま伝播させる。
+                    add_trace_cycles(&mut cycles, trace.cycles);
                     match trace.result {
                         CachedRunResult::Ran => {
                             remaining -= trace.instructions;
                             *retired += trace.instructions;
+                            if let Some(reason) = cycle_batch_exit(cycles, cycle_limit) {
+                                return BatchInnerExit { reason, cycles };
+                            }
                             if watch && watch_pcs.contains(&self.pc) {
                                 return BatchInnerExit {
                                     reason: BatchInnerExitReason::Watched(self.pc),
@@ -1223,6 +1338,10 @@ impl CpuCore {
             }
             remaining -= 1;
             *retired += 1;
+            if let Some(reason) = cycle_batch_exit(cycles, cycle_limit) {
+                trace_jit::stop_recording(self);
+                return BatchInnerExit { reason, cycles };
+            }
             if watch && watch_pcs.contains(&self.pc) {
                 trace_jit::stop_recording(self);
                 return BatchInnerExit {

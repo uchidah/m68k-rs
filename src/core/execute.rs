@@ -453,6 +453,10 @@ impl CpuCore {
                         known_complex = true;
                         opcode
                     }
+                    BatchInnerExitReason::CycleLimit
+                    | BatchInnerExitReason::CycleAccountingUnknown => {
+                        unreachable!("instruction-budgeted batch cannot return a cycle exit")
+                    }
                 }
             } else {
                 self.ppc = self.pc;
