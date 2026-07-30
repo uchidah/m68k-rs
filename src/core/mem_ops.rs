@@ -18,6 +18,7 @@
 //!   window check, exactly like bus accesses in the interpreter.
 
 use super::cpu::CpuCore;
+use super::ea::AddressingMode;
 use super::op_cache::{AddrOp, BinaryOp, BitOp, is_pre_68020};
 use super::types::{CpuType, Size};
 
@@ -50,6 +51,24 @@ pub(crate) enum FastEa {
 }
 
 impl FastEa {
+    #[inline]
+    fn addressing_mode(self) -> AddressingMode {
+        match self {
+            Self::DataReg(reg) => AddressingMode::DataDirect(reg),
+            Self::AddrReg(reg) => AddressingMode::AddressDirect(reg),
+            Self::AnInd(reg) => AddressingMode::AddressIndirect(reg),
+            Self::AnPostInc(reg) => AddressingMode::PostIncrement(reg),
+            Self::AnPreDec(reg) => AddressingMode::PreDecrement(reg),
+            Self::AnDisp(reg) => AddressingMode::Displacement(reg),
+            Self::AnIndex(reg) => AddressingMode::Index(reg),
+            Self::AbsW => AddressingMode::AbsoluteShort,
+            Self::AbsL => AddressingMode::AbsoluteLong,
+            Self::PcDisp => AddressingMode::PcDisplacement,
+            Self::PcIndex => AddressingMode::PcIndex,
+            Self::Imm => AddressingMode::Immediate,
+        }
+    }
+
     #[inline]
     fn decode(mode: u16, reg: u16) -> Option<FastEa> {
         Some(match mode & 7 {
@@ -230,6 +249,23 @@ impl DecodedMemOp {
             0x5 => decode_group_5(opcode),
             0x6 => decode_group_6(opcode),
             0x8 | 0x9 | 0xB | 0xC | 0xD => decode_alu(opcode),
+            _ => None,
+        }
+    }
+
+    /// Cycle count for fastmem operations whose timing is independent of
+    /// runtime data. Unsupported operations keep using the interpreter until
+    /// their timing model is added.
+    #[inline]
+    pub(crate) fn cycle_cost(self, cpu: &CpuCore) -> Option<i32> {
+        match self {
+            Self::Move { size, src, dst } if matches!(dst, FastEa::AddrReg(_)) => {
+                Some(4 + cpu.ea_time(src.addressing_mode(), size))
+            }
+            Self::Move { size, src, dst } => Some(
+                4 + cpu.ea_time(src.addressing_mode(), size)
+                    + cpu.move_dst_time(dst.addressing_mode(), size),
+            ),
             _ => None,
         }
     }
@@ -1774,6 +1810,48 @@ fn apply_binary_to_reg(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn move_cycle_cost_matches_m68000_timing_formula() {
+        let mut cpu = CpuCore::new();
+        cpu.set_cpu_type(CpuType::M68000);
+
+        assert_eq!(
+            DecodedMemOp::Move {
+                size: Size::Long,
+                src: FastEa::AnInd(0),
+                dst: FastEa::DataReg(0),
+            }
+            .cycle_cost(&cpu),
+            Some(12)
+        );
+        assert_eq!(
+            DecodedMemOp::Move {
+                size: Size::Long,
+                src: FastEa::DataReg(0),
+                dst: FastEa::AnInd(0),
+            }
+            .cycle_cost(&cpu),
+            Some(12)
+        );
+        assert_eq!(
+            DecodedMemOp::Move {
+                size: Size::Word,
+                src: FastEa::AnDisp(0),
+                dst: FastEa::AddrReg(0),
+            }
+            .cycle_cost(&cpu),
+            Some(12)
+        );
+        assert_eq!(
+            DecodedMemOp::Tst {
+                size: Size::Word,
+                ea: FastEa::AnInd(0),
+            }
+            .cycle_cost(&cpu),
+            None
+        );
+    }
 
     fn cpu_with_window(mem: &mut [u8]) -> CpuCore {
         let mut cpu = CpuCore::new();
