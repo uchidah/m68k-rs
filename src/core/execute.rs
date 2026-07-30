@@ -7,7 +7,7 @@ use super::decode::{dispatch_instruction, needs_rollback_snapshot};
 use super::memory::AddressBus;
 #[cfg(not(target_family = "wasm"))]
 use super::op_cache::DecodedSimpleOp;
-use super::op_cache::{BatchInnerExit, CachedRunResult};
+use super::op_cache::{BatchInnerExitReason, CachedRunResult};
 use super::trace_jit;
 use super::types::{
     BatchExit, BatchResult, CycleBatchControl, CycleBatchExit, CycleBatchResult, StepResult,
@@ -423,31 +423,33 @@ impl CpuCore {
 
             let mut known_complex = false;
             let opcode = if self.can_run_decoded_simple_ops() {
-                match self.run_decoded_simple_batch(
+                let batch_exit = self.run_decoded_simple_batch(
                     bus,
                     max_instructions - retired,
                     watch_pcs,
                     &mut retired,
                     probe_on_entry,
-                ) {
-                    BatchInnerExit::Budget => {
+                );
+                let _cycle_accounting = batch_exit.cycles;
+                match batch_exit.reason {
+                    BatchInnerExitReason::Budget => {
                         return BatchResult {
                             instructions: retired,
                             exit: BatchExit::BudgetExhausted,
                         };
                     }
-                    BatchInnerExit::Watched(pc) => {
+                    BatchInnerExitReason::Watched(pc) => {
                         return BatchResult {
                             instructions: retired,
                             exit: BatchExit::WatchedPc { pc },
                         };
                     }
-                    BatchInnerExit::Fault => {
+                    BatchInnerExitReason::Fault => {
                         self.run_mode = RUN_MODE_NORMAL;
                         probe_on_entry = true;
                         continue;
                     }
-                    BatchInnerExit::Miss(opcode) => {
+                    BatchInnerExitReason::Miss(opcode) => {
                         known_complex = true;
                         opcode
                     }

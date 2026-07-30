@@ -173,7 +173,13 @@ pub(crate) enum CachedRunResult {
 }
 
 /// Result of the instruction-budgeted fast loop used by `run_batch`.
-pub(crate) enum BatchInnerExit {
+pub(crate) struct BatchInnerExit {
+    pub(crate) reason: BatchInnerExitReason,
+    /// `None` は、retire 済み経路に未検証の cycle model が含まれることを表す。
+    pub(crate) cycles: Option<u64>,
+}
+
+pub(crate) enum BatchInnerExitReason {
     /// The remaining instruction budget hit zero.
     Budget,
     /// Execution reached a PC in the caller's watch list.
@@ -184,6 +190,33 @@ pub(crate) enum BatchInnerExit {
     /// the opcode has been fetched (`ppc`/`ir` are set) and full
     /// dispatch should handle it.
     Miss(u16),
+}
+
+#[inline]
+fn add_batch_cycles(total: &mut Option<u64>, cycles: Option<i32>) {
+    *total = (*total).and_then(|total| {
+        cycles
+            .and_then(|cycles| u64::try_from(cycles).ok())
+            .and_then(|cycles| total.checked_add(cycles))
+    });
+}
+
+#[cfg(test)]
+mod batch_cycle_tests {
+    use super::add_batch_cycles;
+
+    #[test]
+    fn unknown_batch_cycles_are_not_reintroduced_as_zero() {
+        let mut total = Some(4_u64);
+        add_batch_cycles(&mut total, Some(8));
+        assert_eq!(total, Some(12));
+
+        add_batch_cycles(&mut total, None);
+        assert_eq!(total, None);
+
+        add_batch_cycles(&mut total, Some(4));
+        assert_eq!(total, None);
+    }
 }
 
 impl DecodedSimpleOp {
@@ -957,10 +990,10 @@ impl CpuCore {
         while self.cycles_remaining > 0 {
             if probe {
                 probe = false;
-                if let Some((result, _instructions)) =
+                if let Some(trace) =
                     trace_jit::try_execute_trace(self, bus, cpu_type, u32::MAX, false, &[])
                 {
-                    match result {
+                    match trace.result {
                         CachedRunResult::Ran => {
                             probe = true;
                             continue;
@@ -1027,6 +1060,7 @@ impl CpuCore {
         let cpu_type = self.cpu_type;
         let watch = !watch_pcs.is_empty();
         let mut remaining = budget;
+        let mut cycles = Some(0_u64);
         // See `execute_decoded_simple_run`: probe the trace cache only on
         // entry and after backward branches, never per instruction.
         let mut probe = probe_on_entry && trace_jit::has_trace_candidates();
@@ -1046,7 +1080,7 @@ impl CpuCore {
                 // having an unrelated watch (for example, a clean-exit
                 // sentinel at PC 0) must not serialize every JIT iteration.
                 let single_iter = watch && watch_pcs.contains(&self.pc);
-                if let Some((result, instructions)) = trace_jit::try_execute_trace(
+                if let Some(trace) = trace_jit::try_execute_trace(
                     self,
                     bus,
                     cpu_type,
@@ -1054,18 +1088,34 @@ impl CpuCore {
                     single_iter,
                     watch_pcs,
                 ) {
-                    match result {
+                    // trace JIT は合計 cycle をまだ公開しないため、ここで
+                    // 不明扱いにする。既知 cycle を 0 としてはいけない。
+                    cycles = trace.cycles;
+                    match trace.result {
                         CachedRunResult::Ran => {
-                            remaining -= instructions;
-                            *retired += instructions;
+                            remaining -= trace.instructions;
+                            *retired += trace.instructions;
                             if watch && watch_pcs.contains(&self.pc) {
-                                return BatchInnerExit::Watched(self.pc);
+                                return BatchInnerExit {
+                                    reason: BatchInnerExitReason::Watched(self.pc),
+                                    cycles,
+                                };
                             }
                             probe = true;
                             continue;
                         }
-                        CachedRunResult::Fault => return BatchInnerExit::Fault,
-                        CachedRunResult::Miss(opcode) => return BatchInnerExit::Miss(opcode),
+                        CachedRunResult::Fault => {
+                            return BatchInnerExit {
+                                reason: BatchInnerExitReason::Fault,
+                                cycles,
+                            };
+                        }
+                        CachedRunResult::Miss(opcode) => {
+                            return BatchInnerExit {
+                                reason: BatchInnerExitReason::Miss(opcode),
+                                cycles,
+                            };
+                        }
                     }
                 }
             }
@@ -1086,14 +1136,20 @@ impl CpuCore {
                 } else {
                     let opcode = self.read_opcode_16(bus);
                     if self.run_mode == RUN_MODE_BERR_AERR_RESET {
-                        return BatchInnerExit::Fault;
+                        return BatchInnerExit {
+                            reason: BatchInnerExitReason::Fault,
+                            cycles,
+                        };
                     }
                     opcode
                 }
             } else {
                 let opcode = self.read_opcode_16(bus);
                 if self.run_mode == RUN_MODE_BERR_AERR_RESET {
-                    return BatchInnerExit::Fault;
+                    return BatchInnerExit {
+                        reason: BatchInnerExitReason::Fault,
+                        cycles,
+                    };
                 }
                 opcode
             };
@@ -1107,7 +1163,8 @@ impl CpuCore {
                     } else {
                         None
                     };
-                    let _cycles = op.execute(self);
+                    let instruction_cycles = op.execute(self);
+                    add_batch_cycles(&mut cycles, Some(instruction_cycles));
                     trace_jit::record_executed(self, bus, self.ppc, self.pc);
                     if let Some(branch_pc) = branch_pc
                         && self.pc <= branch_pc
@@ -1116,12 +1173,17 @@ impl CpuCore {
                     }
                 }
                 CachedOp::Mem(op) => {
-                    if matches!(
-                        super::mem_ops::execute_mem_op_with_cycles(self, op),
-                        super::mem_ops::FastMemExecution::Fallback
-                    ) {
-                        trace_jit::stop_recording(self);
-                        return BatchInnerExit::Miss(opcode);
+                    match super::mem_ops::execute_mem_op_with_cycles(self, op) {
+                        super::mem_ops::FastMemExecution::Executed {
+                            cycles: instruction_cycles,
+                        } => add_batch_cycles(&mut cycles, instruction_cycles),
+                        super::mem_ops::FastMemExecution::Fallback => {
+                            trace_jit::stop_recording(self);
+                            return BatchInnerExit {
+                                reason: BatchInnerExitReason::Miss(opcode),
+                                cycles,
+                            };
+                        }
                     }
                     #[cfg(feature = "trace-profile")]
                     super::trace_profile::note_decoded_mem(self.ppc, opcode);
@@ -1135,19 +1197,28 @@ impl CpuCore {
                     trace_jit::stop_recording(self);
                     #[cfg(feature = "trace-profile")]
                     trace_jit::stop_recording_at_blocker(self, self.ppc, opcode);
-                    return BatchInnerExit::Miss(opcode);
+                    return BatchInnerExit {
+                        reason: BatchInnerExitReason::Miss(opcode),
+                        cycles,
+                    };
                 }
             }
             remaining -= 1;
             *retired += 1;
             if watch && watch_pcs.contains(&self.pc) {
                 trace_jit::stop_recording(self);
-                return BatchInnerExit::Watched(self.pc);
+                return BatchInnerExit {
+                    reason: BatchInnerExitReason::Watched(self.pc),
+                    cycles,
+                };
             }
         }
 
         trace_jit::stop_recording(self);
-        BatchInnerExit::Budget
+        BatchInnerExit {
+            reason: BatchInnerExitReason::Budget,
+            cycles,
+        }
     }
 
     #[inline]

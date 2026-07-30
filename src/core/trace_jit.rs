@@ -1449,6 +1449,14 @@ struct CompileParams<'a> {
     address_mask: u32,
 }
 
+/// Result of one trace-JIT execution attempt.
+pub(crate) struct TraceExecution {
+    pub(crate) result: CachedRunResult,
+    pub(crate) instructions: u32,
+    /// Trace 内の合計 cycle はまだ公開されていない。
+    pub(crate) cycles: Option<u64>,
+}
+
 /// Attempt to execute a compiled trace at the current PC. See
 /// [`TraceJit::try_execute`] for the meaning of the returned count and of
 /// `instr_budget`/`single_iter`.
@@ -1459,14 +1467,20 @@ pub(crate) fn try_execute_trace<B: AddressBus>(
     instr_budget: u32,
     single_iter: bool,
     watch_pcs: &[u32],
-) -> Option<(CachedRunResult, u32)> {
+) -> Option<TraceExecution> {
     if cpu.run_mode == RUN_MODE_BERR_AERR_RESET {
         return None;
     }
 
-    TRACE_JIT.with_borrow_mut(|jit| {
-        jit.try_execute(cpu, bus, cpu_type, instr_budget, single_iter, watch_pcs)
-    })
+    TRACE_JIT
+        .with_borrow_mut(|jit| {
+            jit.try_execute(cpu, bus, cpu_type, instr_budget, single_iter, watch_pcs)
+        })
+        .map(|(result, instructions)| TraceExecution {
+            result,
+            instructions,
+            cycles: None,
+        })
 }
 
 pub(crate) fn record_trace_target(pc: u32, cpu_type: CpuType) {
