@@ -280,4 +280,16 @@ pub enum CycleBatchExit {
     Breakpoint { bp_num: u8 },
     /// Illegal instruction.
     IllegalInstruction { opcode: u16 },
+    /// The caller's instruction-boundary hook requested a stop.
+    CallbackRequestedStop,
+}
+
+/// Control flow returned by an instruction-boundary hook supplied to
+/// [`CpuCore::run_until_cycles_with_hook`](crate::CpuCore::run_until_cycles_with_hook).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CycleBatchControl {
+    /// Continue executing until another stop condition is reached.
+    Continue,
+    /// Return after the just-completed instruction.
+    Stop,
 }

@@ -13,6 +13,6 @@ pub mod mmu;
 pub use core::cpu::CpuCore;
 pub use core::memory::{AddressBus, FastMem, LinearMemoryBus};
 pub use core::types::{
-    BatchExit, BatchResult, CpuType, CycleBatchExit, CycleBatchResult, HleHandler, NoOpHleHandler,
-    Size, StepResult,
+    BatchExit, BatchResult, CpuType, CycleBatchControl, CycleBatchExit, CycleBatchResult,
+    HleHandler, NoOpHleHandler, Size, StepResult,
 };

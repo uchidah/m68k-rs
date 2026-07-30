@@ -2,7 +2,7 @@
 //! execution entry point used by HLE embedders.
 
 use m68k::core::memory::AddressBus;
-use m68k::{BatchExit, CpuCore, CpuType, CycleBatchExit, LinearMemoryBus};
+use m68k::{BatchExit, CpuCore, CpuType, CycleBatchControl, CycleBatchExit, LinearMemoryBus};
 
 fn cpu_at(pc: u32) -> CpuCore {
     let mut cpu = CpuCore::new();
@@ -74,6 +74,25 @@ fn cycle_batch_honors_watches_before_the_cycle_limit() {
     assert_eq!(result.exit, CycleBatchExit::WatchedPc { pc: 0x1002 });
     assert_eq!(result.instructions, 1);
     assert_eq!(result.cycles, 4);
+}
+
+#[test]
+fn cycle_batch_hook_stops_after_the_completed_instruction() {
+    let mut bus = bus_with(&[(0x1000, 0x7001), (0x1002, 0x7002)]);
+    let mut cpu = cpu_at(0x1000);
+    let mut calls = 0;
+
+    let result = cpu.run_until_cycles_with_hook(&mut bus, 100, &[], |_, _, cycles| {
+        calls += 1;
+        assert_eq!(cycles, 4);
+        CycleBatchControl::Stop
+    });
+
+    assert_eq!(result.exit, CycleBatchExit::CallbackRequestedStop);
+    assert_eq!(result.instructions, 1);
+    assert_eq!(result.cycles, 4);
+    assert_eq!(calls, 1);
+    assert_eq!(cpu.pc, 0x1002);
 }
 
 #[test]

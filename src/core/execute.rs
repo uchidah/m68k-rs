@@ -9,7 +9,9 @@ use super::memory::AddressBus;
 use super::op_cache::DecodedSimpleOp;
 use super::op_cache::{BatchInnerExit, CachedRunResult};
 use super::trace_jit;
-use super::types::{BatchExit, BatchResult, CycleBatchExit, CycleBatchResult, StepResult};
+use super::types::{
+    BatchExit, BatchResult, CycleBatchControl, CycleBatchExit, CycleBatchResult, StepResult,
+};
 
 /// Stop level constants.
 pub const STOP_LEVEL_STOP: u32 = 1;
@@ -266,6 +268,29 @@ impl CpuCore {
         max_cycles: u64,
         watch_pcs: &[u32],
     ) -> CycleBatchResult {
+        self.run_until_cycles_with_hook(bus, max_cycles, watch_pcs, |_, _, _| {
+            CycleBatchControl::Continue
+        })
+    }
+
+    /// Execute instructions until their reported cycles reach or cross a
+    /// caller-provided limit, invoking `after_instruction` after every
+    /// completed instruction.
+    ///
+    /// The hook may update peripheral state, alter the CPU interrupt level,
+    /// or request that execution return at the current instruction boundary.
+    /// It is not invoked for a surfaced trap because that instruction has not
+    /// retired; the embedder remains responsible for handling the trap.
+    pub fn run_until_cycles_with_hook<B: AddressBus, F>(
+        &mut self,
+        bus: &mut B,
+        max_cycles: u64,
+        watch_pcs: &[u32],
+        mut after_instruction: F,
+    ) -> CycleBatchResult
+    where
+        F: FnMut(&mut CpuCore, &mut B, u32) -> CycleBatchControl,
+    {
         let mut instructions = 0;
         let mut cycles = 0;
 
@@ -284,6 +309,15 @@ impl CpuCore {
                 } => {
                     instructions += 1;
                     cycles += instruction_cycles as u64;
+                    if after_instruction(self, bus, instruction_cycles as u32)
+                        == CycleBatchControl::Stop
+                    {
+                        return CycleBatchResult {
+                            instructions,
+                            cycles,
+                            exit: CycleBatchExit::CallbackRequestedStop,
+                        };
+                    }
                 }
                 StepResult::Stopped => {
                     return CycleBatchResult {
