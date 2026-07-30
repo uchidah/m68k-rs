@@ -9,7 +9,7 @@ use super::memory::AddressBus;
 use super::op_cache::DecodedSimpleOp;
 use super::op_cache::{BatchInnerExit, CachedRunResult};
 use super::trace_jit;
-use super::types::{BatchExit, BatchResult, StepResult};
+use super::types::{BatchExit, BatchResult, CycleBatchExit, CycleBatchResult, StepResult};
 
 /// Stop level constants.
 pub const STOP_LEVEL_STOP: u32 = 1;
@@ -245,6 +245,114 @@ impl CpuCore {
         self.fm_base = 0;
         self.fm_len = 0;
         result
+    }
+
+    /// Execute instructions until their reported cycles reach or cross a
+    /// caller-provided limit.
+    ///
+    /// The limit is checked only after an instruction has completed. This
+    /// lets an embedder select its nearest device deadline, run without a
+    /// host round-trip per instruction, and then advance devices by the
+    /// returned cycle count. A-line/F-line and other traps are surfaced with
+    /// the same state and accounting rules as [`step`](Self::step).
+    ///
+    /// This initial cycle-accounted path deliberately uses `step()` rather
+    /// than the decoded/trace batch fast paths: those paths currently discard
+    /// per-instruction cycle data. Keeping this API cycle-correct gives the
+    /// optimized paths a stable differential-test target.
+    pub fn run_until_cycles<B: AddressBus>(
+        &mut self,
+        bus: &mut B,
+        max_cycles: u64,
+        watch_pcs: &[u32],
+    ) -> CycleBatchResult {
+        let mut instructions = 0;
+        let mut cycles = 0;
+
+        if max_cycles == 0 {
+            return CycleBatchResult {
+                instructions,
+                cycles,
+                exit: CycleBatchExit::CycleLimitReached,
+            };
+        }
+
+        loop {
+            match self.step(bus) {
+                StepResult::Ok {
+                    cycles: instruction_cycles,
+                } => {
+                    instructions += 1;
+                    cycles += instruction_cycles as u64;
+                }
+                StepResult::Stopped => {
+                    return CycleBatchResult {
+                        instructions,
+                        cycles,
+                        exit: CycleBatchExit::Stopped,
+                    };
+                }
+                StepResult::AlineTrap { opcode } => {
+                    return CycleBatchResult {
+                        instructions,
+                        cycles,
+                        exit: CycleBatchExit::AlineTrap { opcode },
+                    };
+                }
+                StepResult::FlineTrap { opcode } => {
+                    return CycleBatchResult {
+                        instructions,
+                        cycles,
+                        exit: CycleBatchExit::FlineTrap { opcode },
+                    };
+                }
+                StepResult::TrapInstruction { trap_num } => {
+                    return CycleBatchResult {
+                        instructions,
+                        cycles,
+                        exit: CycleBatchExit::TrapInstruction { trap_num },
+                    };
+                }
+                StepResult::Breakpoint { bp_num } => {
+                    return CycleBatchResult {
+                        instructions,
+                        cycles,
+                        exit: CycleBatchExit::Breakpoint { bp_num },
+                    };
+                }
+                StepResult::IllegalInstruction { opcode } => {
+                    return CycleBatchResult {
+                        instructions,
+                        cycles,
+                        exit: CycleBatchExit::IllegalInstruction { opcode },
+                    };
+                }
+            }
+
+            if self.stopped != 0 {
+                return CycleBatchResult {
+                    instructions,
+                    cycles,
+                    exit: CycleBatchExit::Stopped,
+                };
+            }
+
+            if !watch_pcs.is_empty() && watch_pcs.contains(&self.pc) {
+                return CycleBatchResult {
+                    instructions,
+                    cycles,
+                    exit: CycleBatchExit::WatchedPc { pc: self.pc },
+                };
+            }
+
+            if cycles >= max_cycles {
+                return CycleBatchResult {
+                    instructions,
+                    cycles,
+                    exit: CycleBatchExit::CycleLimitReached,
+                };
+            }
+        }
     }
 
     fn run_batch_inner<B: AddressBus>(

@@ -240,3 +240,44 @@ pub struct BatchResult {
     /// Why the batch returned.
     pub exit: BatchExit,
 }
+
+/// Result of a [`CpuCore::run_until_cycles`](crate::CpuCore::run_until_cycles)
+/// call.
+///
+/// This is intentionally separate from [`BatchResult`]: `run_batch` is
+/// instruction-budgeted, while `run_until_cycles` stops after completing the
+/// instruction that reaches or crosses a cycle limit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CycleBatchResult {
+    /// Number of instructions that fully retired during the run.
+    ///
+    /// As with [`BatchResult`], a surfaced trap is not included because the
+    /// embedder decides how to account for it after handling the trap.
+    pub instructions: u32,
+    /// Cycles reported by the retired instructions.
+    pub cycles: u64,
+    /// Why execution returned.
+    pub exit: CycleBatchExit,
+}
+
+/// Reason a [`CpuCore::run_until_cycles`](crate::CpuCore::run_until_cycles)
+/// call returned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CycleBatchExit {
+    /// The requested cycle limit was reached or crossed after an instruction.
+    CycleLimitReached,
+    /// The CPU is stopped.
+    Stopped,
+    /// Execution reached a PC in the caller's watch list.
+    WatchedPc { pc: u32 },
+    /// A-line trap (0xAxxx opcode).
+    AlineTrap { opcode: u16 },
+    /// F-line trap (0xFxxx opcode).
+    FlineTrap { opcode: u16 },
+    /// TRAP #n instruction.
+    TrapInstruction { trap_num: u8 },
+    /// BKPT #n instruction.
+    Breakpoint { bp_num: u8 },
+    /// Illegal instruction.
+    IllegalInstruction { opcode: u16 },
+}

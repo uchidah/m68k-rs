@@ -2,7 +2,7 @@
 //! execution entry point used by HLE embedders.
 
 use m68k::core::memory::AddressBus;
-use m68k::{BatchExit, CpuCore, CpuType, LinearMemoryBus};
+use m68k::{BatchExit, CpuCore, CpuType, CycleBatchExit, LinearMemoryBus};
 
 fn cpu_at(pc: u32) -> CpuCore {
     let mut cpu = CpuCore::new();
@@ -34,6 +34,46 @@ fn budget_exhausted_returns_exact_instruction_count() {
     assert_eq!(result.exit, BatchExit::BudgetExhausted);
     assert_eq!(result.instructions, 100);
     assert_eq!(cpu.pc, 0x1000 + 100 * 2);
+}
+
+#[test]
+fn cycle_batch_stops_after_crossing_limit() {
+    // MOVEQ takes four cycles on M68000. A six-cycle limit therefore retires
+    // two instructions and returns the eight cycles actually consumed.
+    let mut bus = bus_with(&[(0x1000, 0x7001), (0x1002, 0x7002)]);
+    let mut cpu = cpu_at(0x1000);
+
+    let result = cpu.run_until_cycles(&mut bus, 6, &[]);
+
+    assert_eq!(result.exit, CycleBatchExit::CycleLimitReached);
+    assert_eq!(result.instructions, 2);
+    assert_eq!(result.cycles, 8);
+    assert_eq!(cpu.pc, 0x1004);
+}
+
+#[test]
+fn cycle_batch_surfaces_traps_without_counting_them() {
+    let mut bus = bus_with(&[(0x1000, 0x7001), (0x1002, 0xA123)]);
+    let mut cpu = cpu_at(0x1000);
+
+    let result = cpu.run_until_cycles(&mut bus, 100, &[]);
+
+    assert_eq!(result.exit, CycleBatchExit::AlineTrap { opcode: 0xA123 });
+    assert_eq!(result.instructions, 1);
+    assert_eq!(result.cycles, 4);
+    assert_eq!(cpu.pc, 0x1004);
+}
+
+#[test]
+fn cycle_batch_honors_watches_before_the_cycle_limit() {
+    let mut bus = bus_with(&[(0x1000, 0x7001), (0x1002, 0x7002)]);
+    let mut cpu = cpu_at(0x1000);
+
+    let result = cpu.run_until_cycles(&mut bus, 100, &[0x1002]);
+
+    assert_eq!(result.exit, CycleBatchExit::WatchedPc { pc: 0x1002 });
+    assert_eq!(result.instructions, 1);
+    assert_eq!(result.cycles, 4);
 }
 
 #[test]
