@@ -25,7 +25,16 @@ pub const RUN_MODE_BERR_AERR_RESET: u32 = 1;
 /// Decode the deliberately narrow register-only subset whose precise
 /// instruction completion is preserved by the boundary-hook dispatcher.
 #[inline]
-fn decode_boundary_hook_op(cpu_type: CpuType, opcode: u16) -> Option<DecodedSimpleOp> {
+fn decode_boundary_hook_op(cpu_type: CpuType, opcode: u16) -> Option<BoundaryHookOp> {
+    // CMP.W #imm,Dn is admitted only on M68000. The extension word remains
+    // unread during classification so the shared precise executor owns its
+    // prefetch, fault, and rollback behavior.
+    if cpu_type == CpuType::M68000 && opcode & 0xF1FF == 0xB07C {
+        return Some(BoundaryHookOp::CmpWordImmediate {
+            reg: ((opcode >> 9) & 7) as u8,
+        });
+    }
+
     let decoded = DecodedSimpleOp::decode(cpu_type, opcode);
     match (cpu_type, decoded) {
         // M68040 NOP is excluded because the normal path performs T0 pipeline
@@ -33,11 +42,11 @@ fn decode_boundary_hook_op(cpu_type: CpuType, opcode: u16) -> Option<DecodedSimp
         (
             CpuType::M68000 | CpuType::M68010 | CpuType::M68020 | CpuType::M68030,
             Some(op @ DecodedSimpleOp::Nop),
-        ) => Some(op),
+        ) => Some(BoundaryHookOp::Simple(op)),
         (
             CpuType::M68000 | CpuType::M68010 | CpuType::M68020 | CpuType::M68030 | CpuType::M68040,
             Some(op @ DecodedSimpleOp::Moveq { .. }),
-        ) if opcode & 0x0100 == 0 => Some(op),
+        ) if opcode & 0x0100 == 0 => Some(BoundaryHookOp::Simple(op)),
         (
             CpuType::M68000 | CpuType::M68010 | CpuType::M68020 | CpuType::M68030 | CpuType::M68040,
             Some(
@@ -47,9 +56,16 @@ fn decode_boundary_hook_op(cpu_type: CpuType, opcode: u16) -> Option<DecodedSimp
                     ..
                 },
             ),
-        ) => Some(op),
+        ) => Some(BoundaryHookOp::Simple(op)),
         _ => None,
     }
+}
+
+/// A bounded operation admitted by the boundary-hook runner after the shared
+/// precise opcode fetch.
+enum BoundaryHookOp {
+    Simple(DecodedSimpleOp),
+    CmpWordImmediate { reg: u8 },
 }
 
 impl CpuCore {
@@ -945,35 +961,55 @@ impl CpuCore {
 
         #[cfg(feature = "runner-profile")]
         super::runner_profile::set_dispatch_kind(match fast_op {
-            DecodedSimpleOp::Nop => super::runner_profile::DispatchKind::Nop,
-            DecodedSimpleOp::Moveq { .. } => super::runner_profile::DispatchKind::Moveq,
-            DecodedSimpleOp::UnaryDataReg {
+            BoundaryHookOp::CmpWordImmediate { .. } => {
+                super::runner_profile::DispatchKind::CmpWordImmediate
+            }
+            BoundaryHookOp::Simple(DecodedSimpleOp::Nop) => {
+                super::runner_profile::DispatchKind::Nop
+            }
+            BoundaryHookOp::Simple(DecodedSimpleOp::Moveq { .. }) => {
+                super::runner_profile::DispatchKind::Moveq
+            }
+            BoundaryHookOp::Simple(DecodedSimpleOp::UnaryDataReg {
                 op: UnaryOp::Clr,
                 size: Size::Word,
                 ..
-            } => super::runner_profile::DispatchKind::ClrWord,
-            DecodedSimpleOp::UnaryDataReg {
+            }) => super::runner_profile::DispatchKind::ClrWord,
+            BoundaryHookOp::Simple(DecodedSimpleOp::UnaryDataReg {
                 op: UnaryOp::Clr,
                 size: Size::Long,
                 ..
-            } => super::runner_profile::DispatchKind::ClrLong,
+            }) => super::runner_profile::DispatchKind::ClrLong,
             _ => super::runner_profile::DispatchKind::Fallback,
         });
 
         let cycles = match (self.cpu_type, fast_op) {
+            // Keep the immediate access in the precise AddressBus path. A
+            // prefetch fault sets run_mode before exec_cmp can update flags.
+            (CpuType::M68000, BoundaryHookOp::CmpWordImmediate { reg }) => {
+                let source = self.read_imm_16(bus) as u32;
+                if self.run_mode == RUN_MODE_BERR_AERR_RESET {
+                    50
+                } else {
+                    self.exec_cmp(Size::Word, source, self.d(reg as usize));
+                    self.cmp_ea_dn_cycles(super::ea::AddressingMode::Immediate, Size::Word)
+                }
+            }
             // The generic decoded executor mutates Dn immediately. M68000
             // CLR.W/L Dn instead performs its final prefetch and IPL poll
             // first, plus the long form's two-clock sync, so reuse the precise
             // implementation for that model after the opcode-only decode.
             (
                 CpuType::M68000,
-                DecodedSimpleOp::UnaryDataReg {
+                BoundaryHookOp::Simple(DecodedSimpleOp::UnaryDataReg {
                     op: UnaryOp::Clr,
                     reg,
                     size,
-                },
+                }),
             ) => self.exec_clr(bus, size, super::ea::AddressingMode::DataDirect(reg)),
-            _ => fast_op.execute(self, bus),
+            (_, BoundaryHookOp::Simple(fast_op)) => fast_op.execute(self, bus),
+            // The classifier admits this variant only for M68000.
+            (_, BoundaryHookOp::CmpWordImmediate { .. }) => unreachable!(),
         };
 
         InternalStepResult::Ok { cycles }
@@ -1373,26 +1409,51 @@ mod tests {
             for opcode in 0x4240..=0x4247 {
                 assert!(matches!(
                     decode_boundary_hook_op(cpu_type, opcode),
-                    Some(DecodedSimpleOp::UnaryDataReg {
+                    Some(BoundaryHookOp::Simple(DecodedSimpleOp::UnaryDataReg {
                         op: UnaryOp::Clr,
                         size: Size::Word,
                         ..
-                    })
+                    }))
                 ));
             }
             for opcode in 0x4280..=0x4287 {
                 assert!(matches!(
                     decode_boundary_hook_op(cpu_type, opcode),
-                    Some(DecodedSimpleOp::UnaryDataReg {
+                    Some(BoundaryHookOp::Simple(DecodedSimpleOp::UnaryDataReg {
                         op: UnaryOp::Clr,
                         size: Size::Long,
                         ..
-                    })
+                    }))
                 ));
             }
             for opcode in [0x4200, 0x4248, 0x4250, 0x42C0] {
                 assert!(decode_boundary_hook_op(cpu_type, opcode).is_none());
             }
+        }
+    }
+
+    #[test]
+    fn boundary_hook_cmp_word_immediate_admission_is_exact() {
+        let valid = [
+            0xB07C, 0xB27C, 0xB47C, 0xB67C, 0xB87C, 0xBA7C, 0xBC7C, 0xBE7C,
+        ];
+        for opcode in valid {
+            assert!(matches!(
+                decode_boundary_hook_op(CpuType::M68000, opcode),
+                Some(BoundaryHookOp::CmpWordImmediate { .. })
+            ));
+            for cpu_type in [
+                CpuType::M68010,
+                CpuType::M68020,
+                CpuType::M68030,
+                CpuType::M68040,
+            ] {
+                assert!(decode_boundary_hook_op(cpu_type, opcode).is_none());
+            }
+        }
+
+        for opcode in [0xB03C, 0xB0BC, 0xB0FC, 0xB07D, 0xB0FC, 0xB0C0, 0xB0BC] {
+            assert!(decode_boundary_hook_op(CpuType::M68000, opcode).is_none());
         }
     }
 }

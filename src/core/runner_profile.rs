@@ -22,6 +22,8 @@ pub enum DispatchKind {
     ClrWord,
     /// The boundary dispatcher handled CLR.L Dn.
     ClrLong,
+    /// The boundary dispatcher handled CMP.W #imm,Dn on M68000.
+    CmpWordImmediate,
 }
 
 /// Bus-operation counts recorded only while a timing sample is active.

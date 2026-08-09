@@ -3,6 +3,7 @@ use m68k::{
     AddressBus, CpuCore, CpuType, CycleBatchControl, CycleBatchExit, CycleBoundaryEvent,
     LinearMemoryBus, StepResult,
 };
+use std::time::Instant;
 
 fn cpu_at(cpu_type: CpuType, pc: u32) -> CpuCore {
     let mut cpu = CpuCore::new();
@@ -1318,7 +1319,7 @@ fn boundary_hook_move_word_data_register_uses_precise_fallback() {
 }
 
 #[test]
-fn boundary_hook_cmp_word_immediate_uses_precise_fallback() {
+fn boundary_hook_cmp_word_immediate_matches_precise_path() {
     for (cpu_type, expected_cycles) in [
         (CpuType::M68000, 8),
         (CpuType::M68010, 4),
@@ -1560,5 +1561,94 @@ fn boundary_hook_cmp_word_immediate_matches_step_when_hook_raises_irq() {
     assert_eq!(
         &boundary_bus.memory[0x7F00..0x8000],
         &precise_bus.memory[0x7F00..0x8000]
+    );
+}
+
+#[test]
+#[ignore = "release-only synthetic performance gate"]
+fn measure_cmp_word_immediate_boundary_dispatch() {
+    const BUDGET: i32 = 100_000_000;
+    const WARMUP_PAIRS: usize = 3;
+    const MEASURED_PAIRS: usize = 10;
+
+    fn run(boundary: bool) -> (u128, m68k::CycleBatchResult, CpuCore, LinearMemoryBus) {
+        let mut bus = bus_with(&[
+            (0x1000, 0xB07C), // CMP.W #1,D0
+            (0x1002, 0x0001),
+            (0x1004, 0x60FA), // BRA.S back to CMP
+        ]);
+        let mut cpu = cpu_at(CpuType::M68000, 0x1000);
+        cpu.set_d(0, 0x1234_8000);
+        let start = Instant::now();
+        let result = if boundary {
+            cpu.run_for_cycles_with_boundary_hook(&mut bus, BUDGET, |_, _, _| {
+                CycleBatchControl::Continue
+            })
+        } else {
+            cpu.run_for_cycles_with_hook(&mut bus, BUDGET, |_, _, _| CycleBatchControl::Continue)
+        };
+        (start.elapsed().as_nanos(), result, cpu, bus)
+    }
+
+    for pair in 0..WARMUP_PAIRS {
+        let _ = run(pair % 2 == 0);
+        let _ = run(pair % 2 != 0);
+    }
+
+    let mut ratios = Vec::with_capacity(MEASURED_PAIRS);
+    for pair in 0..MEASURED_PAIRS {
+        let boundary_first = pair % 2 == 0;
+        let (first_ns, first_result, first_cpu, first_bus) = run(boundary_first);
+        let (second_ns, second_result, second_cpu, second_bus) = run(!boundary_first);
+        let (
+            precise_ns,
+            precise_result,
+            precise_cpu,
+            precise_bus,
+            boundary_ns,
+            boundary_result,
+            boundary_cpu,
+            boundary_bus,
+        ) = if boundary_first {
+            (
+                second_ns,
+                second_result,
+                second_cpu,
+                second_bus,
+                first_ns,
+                first_result,
+                first_cpu,
+                first_bus,
+            )
+        } else {
+            (
+                first_ns,
+                first_result,
+                first_cpu,
+                first_bus,
+                second_ns,
+                second_result,
+                second_cpu,
+                second_bus,
+            )
+        };
+
+        assert_eq!(boundary_result, precise_result);
+        assert_cpu_state_eq(&boundary_cpu, &precise_cpu);
+        assert_eq!(boundary_bus.as_slice(), precise_bus.as_slice());
+        let ratio = boundary_ns as f64 / precise_ns as f64;
+        ratios.push(ratio);
+        println!(
+            "CMP-IMM-BENCH pair={pair} precise_ns={precise_ns} boundary_ns={boundary_ns} ratio={ratio:.6} cycles={} instructions={}",
+            boundary_result.cycles, boundary_result.instructions
+        );
+    }
+
+    ratios.sort_by(f64::total_cmp);
+    println!(
+        "CMP-IMM-BENCH median_ratio={:.6} min_ratio={:.6} max_ratio={:.6}",
+        ratios[MEASURED_PAIRS / 2],
+        ratios[0],
+        ratios[MEASURED_PAIRS - 1]
     );
 }
