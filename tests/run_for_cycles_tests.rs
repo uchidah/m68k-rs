@@ -1218,3 +1218,69 @@ fn boundary_hook_decoded_subset_rejects_reserved_moveq_encoding() {
     assert_eq!(decoded_bus.memory, precise_bus.memory);
     assert_eq!(decoded_bus.word_reads, precise_bus.word_reads);
 }
+
+#[test]
+fn boundary_hook_move_word_data_register_uses_precise_fallback() {
+    for (cpu_type, expected_cycles) in [
+        (CpuType::M68000, 4),
+        (CpuType::M68010, 2),
+        (CpuType::M68020, 2),
+        (CpuType::M68030, 2),
+        (CpuType::M68040, 2),
+    ] {
+        let mut initial_bus = EventBus::new();
+        initial_bus.load_word(0x1000, 0x3200); // MOVE.W D0,D1
+        initial_bus.load_word(0x1002, 0x4E71);
+        initial_bus.start_recording_word_reads();
+
+        let mut precise_bus = initial_bus.clone();
+        let mut boundary_bus = initial_bus;
+        let mut precise_cpu = cpu_at(cpu_type, 0x1000);
+        let mut boundary_cpu = cpu_at(cpu_type, 0x1000);
+        for cpu in [&mut precise_cpu, &mut boundary_cpu] {
+            cpu.set_sr(0x271F);
+            cpu.set_d(0, 0xFFFF_8001);
+            cpu.set_d(1, 0xABCD_5678);
+        }
+
+        let mut precise_events = Vec::new();
+        let precise = precise_cpu.run_for_cycles_with_hook(&mut precise_bus, 100, |_, _, cycles| {
+            precise_events.push(cycles);
+            CycleBatchControl::Return
+        });
+        let mut boundary_events = Vec::new();
+        let boundary = boundary_cpu.run_for_cycles_with_boundary_hook(
+            &mut boundary_bus,
+            100,
+            |_, _, event| {
+                if let CycleBoundaryEvent::Instruction { cycles } = event {
+                    boundary_events.push(cycles);
+                }
+                CycleBatchControl::Return
+            },
+        );
+
+        assert_eq!(boundary, precise, "{cpu_type:?}");
+        assert_eq!(boundary.cycles, expected_cycles, "{cpu_type:?}");
+        assert_eq!(boundary.instructions, 1, "{cpu_type:?}");
+        assert_eq!(precise_events, vec![expected_cycles], "{cpu_type:?}");
+        assert_eq!(boundary_events, precise_events, "{cpu_type:?}");
+        assert_cpu_state_eq(&boundary_cpu, &precise_cpu);
+        assert_eq!(boundary_cpu.d(1), 0xABCD_8001, "{cpu_type:?}");
+        assert_eq!(boundary_cpu.get_sr() & 0x001F, 0x0018, "{cpu_type:?}");
+        assert_eq!(boundary_bus.memory, precise_bus.memory, "{cpu_type:?}");
+        assert_eq!(boundary_bus.bus_events, precise_bus.bus_events, "{cpu_type:?}");
+        assert_eq!(boundary_bus.word_reads, precise_bus.word_reads, "{cpu_type:?}");
+
+        if cpu_type == CpuType::M68000 {
+            assert_eq!(
+                boundary_bus.bus_events,
+                vec![
+                    BusEvent::ReadWord(0x1000),
+                    BusEvent::ReadWord(0x1002),
+                    BusEvent::ReadWord(0x1004),
+                ]
+            );
+        }
+    }
+}
