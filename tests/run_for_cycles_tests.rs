@@ -1,3 +1,4 @@
+use m68k::core::memory::{BusFault, BusFaultKind};
 use m68k::{
     AddressBus, CpuCore, CpuType, CycleBatchControl, CycleBatchExit, CycleBoundaryEvent,
     LinearMemoryBus, StepResult,
@@ -288,6 +289,7 @@ struct EventBus {
     word_reads: Vec<u32>,
     bus_events: Vec<BusEvent>,
     fetch_cached: bool,
+    fault_word_read_at: Option<u32>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -311,6 +313,7 @@ impl EventBus {
             word_reads: Vec::new(),
             bus_events: Vec::new(),
             fetch_cached: true,
+            fault_word_read_at: None,
         }
     }
 
@@ -333,6 +336,17 @@ impl EventBus {
         self.bus_events.clear();
         self.record_word_reads = true;
     }
+
+    fn fault_word_read_at(&mut self, address: u32) {
+        self.fault_word_read_at = Some(address);
+    }
+
+    fn record_word_read(&mut self, address: u32) {
+        if self.record_word_reads {
+            self.word_reads.push(address);
+            self.bus_events.push(BusEvent::ReadWord(address));
+        }
+    }
 }
 
 impl AddressBus for EventBus {
@@ -346,14 +360,25 @@ impl AddressBus for EventBus {
     }
 
     fn read_word(&mut self, address: u32) -> u16 {
-        if self.record_word_reads {
-            self.word_reads.push(address);
-            self.bus_events.push(BusEvent::ReadWord(address));
-        }
+        self.record_word_read(address);
         u16::from_be_bytes([
             self.read_byte(address),
             self.read_byte(address.wrapping_add(1)),
         ])
+    }
+
+    fn try_read_word(&mut self, address: u32) -> Result<u16, BusFault> {
+        self.record_word_read(address);
+        if self.fault_word_read_at == Some(address) {
+            return Err(BusFault {
+                kind: BusFaultKind::BusError,
+                address,
+            });
+        }
+        Ok(u16::from_be_bytes([
+            self.read_byte(address),
+            self.read_byte(address.wrapping_add(1)),
+        ]))
     }
 
     fn read_long(&mut self, address: u32) -> u32 {
@@ -1244,10 +1269,11 @@ fn boundary_hook_move_word_data_register_uses_precise_fallback() {
         }
 
         let mut precise_events = Vec::new();
-        let precise = precise_cpu.run_for_cycles_with_hook(&mut precise_bus, 100, |_, _, cycles| {
-            precise_events.push(cycles);
-            CycleBatchControl::Return
-        });
+        let precise =
+            precise_cpu.run_for_cycles_with_hook(&mut precise_bus, 100, |_, _, cycles| {
+                precise_events.push(cycles);
+                CycleBatchControl::Return
+            });
         let mut boundary_events = Vec::new();
         let boundary = boundary_cpu.run_for_cycles_with_boundary_hook(
             &mut boundary_bus,
@@ -1269,8 +1295,14 @@ fn boundary_hook_move_word_data_register_uses_precise_fallback() {
         assert_eq!(boundary_cpu.d(1), 0xABCD_8001, "{cpu_type:?}");
         assert_eq!(boundary_cpu.get_sr() & 0x001F, 0x0018, "{cpu_type:?}");
         assert_eq!(boundary_bus.memory, precise_bus.memory, "{cpu_type:?}");
-        assert_eq!(boundary_bus.bus_events, precise_bus.bus_events, "{cpu_type:?}");
-        assert_eq!(boundary_bus.word_reads, precise_bus.word_reads, "{cpu_type:?}");
+        assert_eq!(
+            boundary_bus.bus_events, precise_bus.bus_events,
+            "{cpu_type:?}"
+        );
+        assert_eq!(
+            boundary_bus.word_reads, precise_bus.word_reads,
+            "{cpu_type:?}"
+        );
 
         if cpu_type == CpuType::M68000 {
             assert_eq!(
@@ -1283,4 +1315,250 @@ fn boundary_hook_move_word_data_register_uses_precise_fallback() {
             );
         }
     }
+}
+
+#[test]
+fn boundary_hook_cmp_word_immediate_uses_precise_fallback() {
+    for (cpu_type, expected_cycles) in [
+        (CpuType::M68000, 8),
+        (CpuType::M68010, 4),
+        (CpuType::M68020, 4),
+        (CpuType::M68030, 3),
+        (CpuType::M68040, 3),
+    ] {
+        for (immediate, destination, expected_ccr) in [
+            (0x8000, 0x1234_7FFF, 0x1B), // signed overflow and unsigned borrow
+            (0x8000, 0x1234_8000, 0x14), // zero result; X remains set
+            (0x0001, 0x1234_8000, 0x12), // signed overflow without borrow
+            (0x0001, 0x1234_0000, 0x19), // negative result and borrow
+        ] {
+            let mut initial_bus = EventBus::new();
+            initial_bus.load_word(0x1000, 0xB07C); // CMP.W #imm,D0
+            initial_bus.load_word(0x1002, immediate);
+            initial_bus.load_word(0x1004, 0x4E71);
+            initial_bus.start_recording_word_reads();
+
+            let mut precise_bus = initial_bus.clone();
+            let mut boundary_bus = initial_bus;
+            let mut precise_cpu = cpu_at(cpu_type, 0x1000);
+            let mut boundary_cpu = cpu_at(cpu_type, 0x1000);
+            for cpu in [&mut precise_cpu, &mut boundary_cpu] {
+                cpu.set_sr(0x271F);
+                cpu.set_d(0, destination);
+            }
+
+            let mut precise_events = Vec::new();
+            let precise =
+                precise_cpu.run_for_cycles_with_hook(&mut precise_bus, 100, |_, _, cycles| {
+                    precise_events.push(cycles);
+                    CycleBatchControl::Return
+                });
+            let mut boundary_events = Vec::new();
+            let boundary = boundary_cpu.run_for_cycles_with_boundary_hook(
+                &mut boundary_bus,
+                100,
+                |_, _, event| {
+                    if let CycleBoundaryEvent::Instruction { cycles } = event {
+                        boundary_events.push(cycles);
+                    }
+                    CycleBatchControl::Return
+                },
+            );
+
+            assert_eq!(
+                boundary, precise,
+                "{cpu_type:?}, immediate={immediate:#06X}"
+            );
+            assert_eq!(boundary.cycles, expected_cycles, "{cpu_type:?}");
+            assert_eq!(boundary.instructions, 1, "{cpu_type:?}");
+            assert_eq!(boundary_events, precise_events, "{cpu_type:?}");
+            assert_cpu_state_eq(&boundary_cpu, &precise_cpu);
+            assert_eq!(boundary_cpu.d(0), destination, "{cpu_type:?}");
+            assert_eq!(boundary_cpu.get_sr() & 0x1F, expected_ccr, "{cpu_type:?}");
+            assert_eq!(boundary_bus.memory, precise_bus.memory, "{cpu_type:?}");
+            assert_eq!(
+                boundary_bus.bus_events, precise_bus.bus_events,
+                "{cpu_type:?}"
+            );
+            assert_eq!(
+                boundary_bus.word_reads, precise_bus.word_reads,
+                "{cpu_type:?}"
+            );
+
+            if cpu_type == CpuType::M68000 {
+                assert_eq!(
+                    boundary_bus.bus_events,
+                    vec![
+                        BusEvent::ReadWord(0x1000),
+                        BusEvent::ReadWord(0x1002),
+                        BusEvent::ReadWord(0x1004),
+                        BusEvent::ReadWord(0x1006),
+                    ]
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn m68000_cmp_word_immediate_warm_prefetch_sequence() {
+    let mut bus = EventBus::new();
+    bus.load_word(0x1000, 0x4E71); // NOP warms the prefetch queue.
+    bus.load_word(0x1002, 0xB07C); // CMP.W #imm,D0
+    bus.load_word(0x1004, 0x8000);
+    bus.load_word(0x1006, 0x4E71);
+    bus.load_word(0x1008, 0x4E71);
+    let mut cpu = cpu_at(CpuType::M68000, 0x1000);
+    cpu.set_d(0, 0x1234_7FFF);
+
+    let warmup = cpu.run_for_cycles_with_hook(&mut bus, 100, |_, _, _| CycleBatchControl::Return);
+    assert_eq!(warmup.cycles, 4);
+    assert_eq!(cpu.pc, 0x1002);
+
+    bus.start_recording_word_reads();
+    let result = cpu.run_for_cycles_with_hook(&mut bus, 100, |_, _, _| CycleBatchControl::Return);
+
+    assert_eq!(result.cycles, 8);
+    assert_eq!(result.instructions, 1);
+    assert_eq!(cpu.pc, 0x1006);
+    assert_eq!(cpu.d(0), 0x1234_7FFF);
+    assert_eq!(
+        bus.bus_events,
+        vec![BusEvent::ReadWord(0x1006), BusEvent::ReadWord(0x1008)]
+    );
+}
+
+#[test]
+fn boundary_hook_cmp_word_immediate_prefetch_fault_matches_precise_path() {
+    for fault_address in [0x1004, 0x1006] {
+        let mut initial_bus = EventBus::new();
+        initial_bus.load_long(0x0008, 0x0000_2000); // Bus error vector.
+        initial_bus.load_word(0x1000, 0xB07C); // CMP.W #imm,D0
+        initial_bus.load_word(0x1002, 0x8000);
+        initial_bus.load_word(0x1004, 0x4E71);
+        initial_bus.load_word(0x1006, 0x4E71);
+        initial_bus.fault_word_read_at(fault_address);
+        initial_bus.start_recording_word_reads();
+
+        let mut precise_bus = initial_bus.clone();
+        let mut boundary_bus = initial_bus;
+        let mut precise_cpu = cpu_at(CpuType::M68000, 0x1000);
+        let mut boundary_cpu = cpu_at(CpuType::M68000, 0x1000);
+        for cpu in [&mut precise_cpu, &mut boundary_cpu] {
+            cpu.set_sr(0x271F);
+            cpu.set_d(0, 0x1234_7FFF);
+        }
+
+        let mut precise_hooks = 0;
+        let precise = precise_cpu.run_for_cycles_with_hook(&mut precise_bus, 100, |_, _, _| {
+            precise_hooks += 1;
+            CycleBatchControl::Return
+        });
+        let mut boundary_hooks = 0;
+        let boundary = boundary_cpu.run_for_cycles_with_boundary_hook(
+            &mut boundary_bus,
+            100,
+            |_, _, event| {
+                if matches!(event, CycleBoundaryEvent::Instruction { .. }) {
+                    boundary_hooks += 1;
+                }
+                CycleBatchControl::Return
+            },
+        );
+
+        assert_eq!(boundary, precise, "fault at {fault_address:#06X}");
+        // The current cycle runners surface this fault after the vector's first
+        // normal instruction reaches the hook; both paths must preserve that
+        // legacy observation point and the fault rollback before it.
+        assert_eq!(boundary.instructions, 1, "fault at {fault_address:#06X}");
+        assert_eq!(
+            boundary_hooks, precise_hooks,
+            "fault at {fault_address:#06X}"
+        );
+        assert_eq!(boundary_hooks, 1, "fault at {fault_address:#06X}");
+        assert_cpu_state_eq(&boundary_cpu, &precise_cpu);
+        assert_eq!(
+            boundary_cpu.d(0),
+            0x1234_7FFF,
+            "fault at {fault_address:#06X}"
+        );
+        assert_eq!(
+            boundary_bus.memory, precise_bus.memory,
+            "fault at {fault_address:#06X}"
+        );
+        assert_eq!(
+            boundary_bus.bus_events, precise_bus.bus_events,
+            "fault at {fault_address:#06X}"
+        );
+        assert_eq!(
+            boundary_bus.word_reads, precise_bus.word_reads,
+            "fault at {fault_address:#06X}"
+        );
+        assert!(boundary_bus.word_reads.contains(&fault_address));
+    }
+}
+
+#[test]
+fn boundary_hook_cmp_word_immediate_matches_step_when_hook_raises_irq() {
+    let mut initial_bus = EventBus::new();
+    initial_bus.load_word(0x1000, 0xB07C); // CMP.W #imm,D0
+    initial_bus.load_word(0x1002, 0x8000);
+    initial_bus.load_word(0x1004, 0x7201); // Must not execute before IRQ entry.
+    initial_bus.load_long(0x006C, 0x0000_2000); // Level-3 autovector.
+    initial_bus.load_word(0x2000, 0x4E71); // Handler entry: must not execute.
+    initial_bus.boundary_on_interrupt_acknowledge = true;
+
+    let mut precise_bus = initial_bus.clone();
+    let mut boundary_bus = initial_bus;
+    let mut precise_cpu = cpu_at(CpuType::M68000, 0x1000);
+    let mut boundary_cpu = cpu_at(CpuType::M68000, 0x1000);
+    for cpu in [&mut precise_cpu, &mut boundary_cpu] {
+        cpu.set_sr(0x2000); // Supervisor, interrupt mask 0.
+        cpu.set_d(0, 0x1234_7FFF);
+    }
+
+    let mut precise_instruction_cycles = Vec::new();
+    let precise = precise_cpu.run_for_cycles_with_hook(&mut precise_bus, 100, |cpu, _, cycles| {
+        precise_instruction_cycles.push(cycles);
+        if cpu.ppc == 0x1000 {
+            cpu.set_irq(3);
+        }
+        CycleBatchControl::Continue
+    });
+    assert_eq!(precise_instruction_cycles.len(), 1);
+
+    let mut boundary_events = Vec::new();
+    let boundary =
+        boundary_cpu.run_for_cycles_with_boundary_hook(&mut boundary_bus, 100, |cpu, _, event| {
+            boundary_events.push(event);
+            if matches!(event, CycleBoundaryEvent::Instruction { .. }) && cpu.ppc == 0x1000 {
+                cpu.set_irq(3);
+            }
+            CycleBatchControl::Continue
+        });
+
+    let instruction_cycles = precise_instruction_cycles[0];
+    assert_eq!(boundary, precise);
+    assert_eq!(
+        boundary_events,
+        vec![
+            CycleBoundaryEvent::Instruction {
+                cycles: instruction_cycles,
+            },
+            CycleBoundaryEvent::InterruptEntry {
+                cycles: precise.cycles - instruction_cycles,
+            },
+        ]
+    );
+    assert_eq!(boundary.instructions, 1);
+    assert_eq!(boundary.exit, CycleBatchExit::BoundaryRequested);
+    assert_eq!(boundary_cpu.pc, 0x2000);
+    assert_eq!(boundary_cpu.d(0), 0x1234_7FFF);
+    assert_eq!(boundary_cpu.d(1), 0);
+    assert_cpu_state_eq(&boundary_cpu, &precise_cpu);
+    assert_eq!(boundary_bus.memory, precise_bus.memory);
+    assert_eq!(
+        &boundary_bus.memory[0x7F00..0x8000],
+        &precise_bus.memory[0x7F00..0x8000]
+    );
 }
