@@ -64,6 +64,9 @@ pub use core::cpu::{
     CACR_FI, PCR_060_RESET, PCR_DFP, PCR_ESS,
 };
 pub use core::memory::{AddressBus, FastMem, LinearMemoryBus};
+/// Deterministic sampled timing for the precise boundary-hook runner.
+#[cfg(feature = "runner-profile")]
+pub use core::runner_profile;
 pub use core::types::{
     BatchExit, BatchResult, CpuType, CycleBatchControl, CycleBatchExit, CycleBatchResult,
     CycleBoundaryEvent, HleHandler, NoOpHleHandler, Size, StepResult,

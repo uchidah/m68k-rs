@@ -862,6 +862,8 @@ impl CpuCore {
         // Part E.2: report internal clocks elapsed before this bus access.
         self.flush_sync(bus);
         let addr = self.address(addr);
+        #[cfg(feature = "runner-profile")]
+        super::runner_profile::mark_next_bus_read_as_fetch();
         match bus.try_read_word(addr) {
             Ok(v) => Some(v),
             Err(_) => {

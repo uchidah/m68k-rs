@@ -332,7 +332,12 @@ impl CpuCore {
         F: FnMut(&mut CpuCore, &mut B, CycleBoundaryEvent) -> CycleBatchControl,
     {
         let before_interrupt = self.cycles_remaining;
-        if !self.check_and_service_interrupts(bus) {
+        #[cfg(feature = "runner-profile")]
+        let profile_start = super::runner_profile::begin_interrupt(self.int_level);
+        let serviced = self.check_and_service_interrupts(bus);
+        #[cfg(feature = "runner-profile")]
+        super::runner_profile::finish_interrupt(profile_start, serviced);
+        if !serviced {
             return None;
         }
         let entry_cycles = before_interrupt - self.cycles_remaining;
@@ -424,6 +429,10 @@ impl CpuCore {
             } else {
                 0
             };
+            #[cfg(feature = "runner-profile")]
+            if CALL_INSTRUCTION_HOOK && CALL_INTERRUPT_HOOK {
+                super::runner_profile::begin_instruction();
+            }
             let step_result = if CALL_INSTRUCTION_HOOK && CALL_INTERRUPT_HOOK {
                 self.step_with_dispatch(bus, CpuCore::dispatch_boundary_hook_decoded)
             } else {
@@ -807,6 +816,8 @@ impl CpuCore {
 
         self.set_precise_bus(true);
         if self.stopped != 0 {
+            #[cfg(feature = "runner-profile")]
+            super::runner_profile::discard_instruction();
             if let Some(cycles) = self.stopped_supervisor_check(bus) {
                 return StepResult::Ok { cycles };
             }
@@ -820,13 +831,20 @@ impl CpuCore {
         self.sr_save = self.get_sr();
         self.ir = self.fetch_opcode(bus) as u32;
 
+        #[cfg(feature = "runner-profile")]
+        super::runner_profile::finish_fetch(self.ppc, self.ir as u16, self.cpu_type);
+
         if self.run_mode == RUN_MODE_BERR_AERR_RESET {
+            #[cfg(feature = "runner-profile")]
+            super::runner_profile::discard_instruction();
             self.end_faulted_instruction();
             return StepResult::Ok { cycles: 0 };
         }
 
         let opcode_fetch_cached = bus.last_fetch_was_cached();
         let result = dispatch(self, bus, self.ir as u16);
+        #[cfg(feature = "runner-profile")]
+        super::runner_profile::finish_dispatch_body();
         let fetch_cached = if matches!(
             self.cpu_type,
             super::types::CpuType::M68EC020 | super::types::CpuType::M68020
@@ -841,9 +859,10 @@ impl CpuCore {
         }
 
         let res = match result {
-            InternalStepResult::Ok { cycles } => StepResult::Ok {
-                cycles: self.finalize_cycles(cycles, fetch_cached),
-            },
+            InternalStepResult::Ok { cycles } => {
+                let cycles = self.finalize_cycles(cycles, fetch_cached);
+                StepResult::Ok { cycles }
+            }
             InternalStepResult::AlineTrap { opcode } => StepResult::AlineTrap { opcode },
             InternalStepResult::FlineTrap { opcode } => StepResult::FlineTrap { opcode },
             InternalStepResult::TrapInstruction { trap_num } => {
@@ -855,6 +874,11 @@ impl CpuCore {
             }
         };
 
+        if !matches!(res, StepResult::Ok { .. }) {
+            #[cfg(feature = "runner-profile")]
+            super::runner_profile::discard_instruction();
+        }
+
         if matches!(res, StepResult::Ok { .. }) {
             if self.run_mode == RUN_MODE_BERR_AERR_RESET {
                 self.end_faulted_instruction();
@@ -864,6 +888,15 @@ impl CpuCore {
             // End-of-instruction prefetch: top the queue back up to two words
             // (a no-op after flow changes, whose refill already filled it).
             self.top_up_prefetch(bus);
+
+            // The profile's finalization span includes the 68000 prefetch
+            // refill above. On that model the next opcode is normally served
+            // from the queue, so this is where its instruction-stream reads
+            // occur.
+            #[cfg(feature = "runner-profile")]
+            if let StepResult::Ok { cycles } = res {
+                super::runner_profile::finish_instruction(cycles);
+            }
 
             // Check for trace exception
             if !self.sst_m68000_compat && self.check_trace() {
@@ -899,12 +932,33 @@ impl CpuCore {
         // Trace states remain on the normal dispatcher so it can preserve trace
         // exceptions and model-specific behavior.
         if self.run_mode != RUN_MODE_NORMAL || (self.t1_flag | self.t0_flag) != 0 {
+            #[cfg(feature = "runner-profile")]
+            super::runner_profile::set_dispatch_kind(super::runner_profile::DispatchKind::Fallback);
             return dispatch_instruction(self, bus, opcode);
         }
 
         let Some(fast_op) = decode_boundary_hook_op(self.cpu_type, opcode) else {
+            #[cfg(feature = "runner-profile")]
+            super::runner_profile::set_dispatch_kind(super::runner_profile::DispatchKind::Fallback);
             return dispatch_instruction(self, bus, opcode);
         };
+
+        #[cfg(feature = "runner-profile")]
+        super::runner_profile::set_dispatch_kind(match fast_op {
+            DecodedSimpleOp::Nop => super::runner_profile::DispatchKind::Nop,
+            DecodedSimpleOp::Moveq { .. } => super::runner_profile::DispatchKind::Moveq,
+            DecodedSimpleOp::UnaryDataReg {
+                op: UnaryOp::Clr,
+                size: Size::Word,
+                ..
+            } => super::runner_profile::DispatchKind::ClrWord,
+            DecodedSimpleOp::UnaryDataReg {
+                op: UnaryOp::Clr,
+                size: Size::Long,
+                ..
+            } => super::runner_profile::DispatchKind::ClrLong,
+            _ => super::runner_profile::DispatchKind::Fallback,
+        });
 
         let cycles = match (self.cpu_type, fast_op) {
             // The generic decoded executor mutates Dn immediately. M68000

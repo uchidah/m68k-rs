@@ -14,6 +14,8 @@ pub(crate) mod mem_ops;
 pub mod memory;
 pub mod op_cache;
 pub mod registers;
+#[cfg(feature = "runner-profile")]
+pub mod runner_profile;
 pub mod status;
 pub mod timing;
 pub mod timing_020;

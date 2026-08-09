@@ -42,6 +42,9 @@ serde = ["dep:serde"]
 # Opt-in trace-opportunity accounting for emulator profiling. Disabled builds
 # contain none of the counters or reporting code.
 trace-profile = []
+# Records deterministic, sampled timing for the precise boundary-hook runner.
+# Disabled builds contain none of the observer state or hot-path branches.
+runner-profile = []
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 cranelift-codegen = { version = "0.132.0", optional = true }
