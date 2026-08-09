@@ -3422,6 +3422,72 @@ mod tests {
     }
 
     #[test]
+    fn m68000_suba_word_register_source_flushes_tail_after_final_prefetch() {
+        let mut cpu = m68000_cpu_with_one_prefetch_word();
+        let mut bus = TraceBus::default();
+        cpu.dar[1] = 0x0000_0002;
+        cpu.dar[8] = 0x0000_1000;
+
+        // SUBA.W D1,A0
+        let cycles = dispatch_group_9(&mut cpu, &mut bus, 0x90c1);
+
+        assert_eq!(cycles, 8);
+        assert_eq!(cpu.a(0), 0x0000_0ffe);
+        assert_eq!(cpu.prefetch_count, 2);
+        assert_eq!(cpu.pending_sync_clocks, 0);
+        assert_eq!(
+            bus.events,
+            vec![Event::ReadWord(0x2002), Event::IplHold, Event::Sync(4)]
+        );
+    }
+
+    #[test]
+    fn adda_suba_word_data_register_source_sign_extends_without_changing_ccr() {
+        for cpu_type in [
+            CpuType::M68000,
+            CpuType::M68010,
+            CpuType::M68020,
+            CpuType::M68030,
+            CpuType::M68040,
+        ] {
+            for (source, expected_add, expected_sub) in [
+                (0x0001_u32, 0x0000_1001_u32, 0x0000_0fff_u32),
+                (0x7fff, 0x0000_8fff, 0xffff_9001),
+                (0x8000, 0xffff_9000, 0x0000_9000),
+                (0xffff, 0x0000_0fff, 0x0000_1001),
+            ] {
+                let mut add_cpu = CpuCore::new();
+                add_cpu.set_cpu_type(cpu_type);
+                add_cpu.pc = 0x2000;
+                add_cpu.dar[7] = source;
+                add_cpu.dar[15] = 0x0000_1000;
+                add_cpu.set_ccr(0x1f);
+                let add_ccr = add_cpu.get_ccr();
+                let mut add_bus = TraceBus::default();
+
+                // ADDA.W D7,A7
+                assert_eq!(dispatch_group_d(&mut add_cpu, &mut add_bus, 0xdec7), 8);
+                assert_eq!(add_cpu.a(7), expected_add);
+                assert_eq!(add_cpu.get_ccr(), add_ccr);
+
+                let mut sub_cpu = CpuCore::new();
+                sub_cpu.set_cpu_type(cpu_type);
+                sub_cpu.pc = 0x2000;
+                sub_cpu.dar[7] = source;
+                sub_cpu.dar[15] = 0x0000_1000;
+                sub_cpu.set_ccr(0x1f);
+                let sub_ccr = sub_cpu.get_ccr();
+                let mut sub_bus = TraceBus::default();
+
+                // SUBA.W D7,A7
+                assert_eq!(dispatch_group_9(&mut sub_cpu, &mut sub_bus, 0x9ec7), 8);
+                assert_eq!(sub_cpu.a(7), expected_sub);
+                assert_eq!(sub_cpu.get_ccr(), sub_ccr);
+            }
+        }
+    }
+
+    #[test]
     fn m68000_addx_long_data_register_flushes_tail_after_final_prefetch() {
         let mut cpu = m68000_cpu_with_one_prefetch_word();
         let mut bus = TraceBus::default();
